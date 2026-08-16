@@ -1,3 +1,6 @@
+# About
+This repository aim to build and deploy a model to predict flight tickets price based on variables that a client can control.
+
 # webscraping
 It shows the scraping archetecture and documentation
 
