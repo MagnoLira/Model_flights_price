@@ -11,7 +11,7 @@ create table raw.flights_scrapy(
 )
 ---------------------------------------- SILVER LAYER ----------------------------------------------
 """
-solicitation_id: unique id idicates a user's session
+id: unique id idicates a user's session
 flight_from: origin airport 
 flight_to: destity airport 
 company: company that operates the flight 
@@ -30,7 +30,7 @@ inserted_at: time that data getes in the table
 
 
 CREATE TABLE silver.flights_scrapy (
-  solicitation_id TEXT,
+  id TEXT,
   flight_from TEXT,
   flight_to TEXT,
   company TEXT,
