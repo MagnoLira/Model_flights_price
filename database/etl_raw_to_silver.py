@@ -22,11 +22,11 @@ for msg in consumer:
 ### PAYLOAD EXAMPLE THAT APPEARS IN CDC 
 ### 1 - SKIPPLAGED
 # {"before":null,"after":{"id":"eb731ee7-ac71-43a1-bedd-79d30d49db1c",
-# "data_json":"{\"raw_text\": \"6h\\n1 stop\\nGOL Linhas Aereas\\n11:00am\\nMCZ\\nGIG\\n5:15pm\\nGYN\\n$163\", \"companhia_bruta\": \"GOL Linhas Aereas\", \"preco_bruto\": null, \"hora_saida_bruta\": \"11:00am\", \"hora_chegada_bruta\": \"5:15pm\", \"data_busca\": \"2025-06-16 21:50:48\", \"link_emissao\": \"https://skiplagged.com/flights/MCZ/GYN/2025-07-10\", \"site\": \"skiplagged\", \"solicitation_id\": \"904#$382\"}","created_at":1750112894433915,"mode":"TESTING"},
+# "data_json":"{\"raw_text\": \"6h\\n1 stop\\nGOL Linhas Aereas\\n11:00am\\nMCZ\\nGIG\\n5:15pm\\nGYN\\n$163\", \"companhia_bruta\": \"GOL Linhas Aereas\", \"preco_bruto\": null, \"hora_saida_bruta\": \"11:00am\", \"hora_chegada_bruta\": \"5:15pm\", \"data_busca\": \"2025-06-16 21:50:48\", \"link_emissao\": \"https://skiplagged.com/flights/MCZ/GYN/2025-07-10\", \"site\": \"skiplagged\", \"id\": \"904#$382\"}","created_at":1750112894433915,"mode":"TESTING"},
 # "source":{"version":"2.5.4.Final","connector":"postgresql","name":"lina","ts_ms":1750123694396,"snapshot":"false","db":"lina","sequence":"[\"28803800\",\"28803800\"]","schema":"raw","table":"flights_scrapy","txId":863,"lsn":28803800,"xmin":null},"op":"c","ts_ms":1750123694727,"transaction":null}
 ### 2 - LATAM
 # {"before":null,"after":{"id":"ae899a52-3e1a-4cc6-a770-80691c7ae252",
-# "data_json":"{\"raw_text\": \"VOO . HORA DE SA\\u00cdDA 17:10, PARTIDA DE MACEI\\u00d3, AEROPORTO MACEIO, HORA DE CHEGADA 8:45 DO DIA SEGUINTE, EM GOI\\u00c2NIA, AEROPORTO GOIANIA. VOO 2 PARADAS, COM DURA\\u00c7\\u00c3O TOTAL DE 15 HORAS 35 MINUTOS. PRE\\u00c7O DE UM ADULTO A PARTIR DE 1366,14 REAIS BRASILEIROS. OPERADO PELA LATAM AIRLINES BRASIL.\", \"link_emissao\": \"https://www.latamairlines.com/br/pt/oferta-voos?origin=MCZ&outbound=2025-07-10T15%3A00%3A00.000Z&destination=GYN&adt=1&chd=0&inf=0&trip=OW&cabin=Economy&redemption=false&sort=RECOMMENDED\", \"site\": \"latam\", \"data_busca\": \"2025-06-16 21:50:09\", \"solicitation_id\": \"904#$382\"}","created_at":1750112894110589,"mode":"TESTING"},
+# "data_json":"{\"raw_text\": \"VOO . HORA DE SA\\u00cdDA 17:10, PARTIDA DE MACEI\\u00d3, AEROPORTO MACEIO, HORA DE CHEGADA 8:45 DO DIA SEGUINTE, EM GOI\\u00c2NIA, AEROPORTO GOIANIA. VOO 2 PARADAS, COM DURA\\u00c7\\u00c3O TOTAL DE 15 HORAS 35 MINUTOS. PRE\\u00c7O DE UM ADULTO A PARTIR DE 1366,14 REAIS BRASILEIROS. OPERADO PELA LATAM AIRLINES BRASIL.\", \"link_emissao\": \"https://www.latamairlines.com/br/pt/oferta-voos?origin=MCZ&outbound=2025-07-10T15%3A00%3A00.000Z&destination=GYN&adt=1&chd=0&inf=0&trip=OW&cabin=Economy&redemption=false&sort=RECOMMENDED\", \"site\": \"latam\", \"data_busca\": \"2025-06-16 21:50:09\", \"id\": \"904#$382\"}","created_at":1750112894110589,"mode":"TESTING"},
 # "source":{"version":"2.5.4.Final","connector":"postgresql","name":"lina","ts_ms":1750123694065,"snapshot":"false","db":"lina","sequence":"[\"28793808\",\"28793808\"]","schema":"raw","table":"flights_scrapy","txId":850,"lsn":28793808,"xmin":null},"op":"c","ts_ms":1750123694203,"transaction":null}
 
 
@@ -53,7 +53,7 @@ conn = get_lina_connection()
 cursor = conn.cursor()
 
 insert_query = """INSERT INTO silver.flights_scrapy (
-  solicitation_id,
+  id,
   flight_from,
   flight_to,
   company,
@@ -142,7 +142,7 @@ class etl_raw_silver():
             return None
 
         self.result = {
-            "solicitation_id": self.raw_data.get("solicitation_id"),
+            "id": self.raw_data.get("id"),
             "flight_from": aeroportos[0].strip().title(),
             "flight_to": aeroportos[1].strip().title(),
             "company": companhia.group(1) if companhia else None,
@@ -184,7 +184,7 @@ class etl_raw_silver():
         chegada_raw = horas[-1] if len(horas) >= 2 else None
 
         self.result = {
-            "solicitation_id": self.raw_data.get("solicitation_id"),
+            "id": self.raw_data.get("id"),
             "flight_from": aer_de,
             "flight_to": aer_para,
             "company": self.raw_data.get("companhia_bruta"),
@@ -220,7 +220,7 @@ def run_consumer():
         if result:
             try:
                 cursor.execute(insert_query, (
-                    result["solicitation_id"],
+                    result["id"],
                     result["flight_from"],
                     result["flight_to"],
                     result["company"],

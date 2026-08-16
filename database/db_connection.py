@@ -5,7 +5,7 @@ def get_lina_connection():
     """Creates and returns a database connection."""
     try:
         POSTGRES_CONFIG = {
-            'dbname': 'lina',
+            'dbname': 'price_models',
             'user': 'postgres',
             'password': 'postgres',
             'host': '192.168.0.33',
