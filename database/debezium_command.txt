@@ -1,0 +1,23 @@
+ curl -X POST http://localhost:8083/connectors \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "pg-lina-connector",
+    "config": {
+      "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+      "plugin.name": "pgoutput",
+      "database.hostname": "hostname",
+      "database.port": "5432",
+      "database.user": "user",
+      "database.password": "password",
+      "database.dbname": "dbname",
+      "database.server.name": "dbserver1",
+      "table.include.list": "raw.flights_scrapy",
+      "slot.name": "flights_scrapy_slot",
+      "publication.name": "flights_scrapy_pub",
+      "topic.prefix": "lina",
+      "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+      "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+      "key.converter.schemas.enable": false,
+      "value.converter.schemas.enable": false
+    }
+  }'
