@@ -50,7 +50,7 @@ print("Consumidor iniciado. Aguardando mensagens...")
 
 for msg in consumer:
     data = msg.value
-    print("📥 Mensagem recebida:", data)
+    print("Mensagem recebida:", data)
 
     try:
         cursor.execute(INSERT_QUERY, (
