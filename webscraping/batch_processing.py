@@ -10,57 +10,48 @@ import json
 from kafka import KafkaProducer
 
 
-
-
-
-
-#Kafka setup
+# Kafka setup
 producer = KafkaProducer(
     bootstrap_servers='192.168.0.33:9092',
     value_serializer=lambda v: json.dumps(v).encode('utf-8')
 )
 
 
-
-
-
 def chunked(iterable, size):
     it = iter(iterable)
-    while True:                                    
+    while True:
         chunk = list(islice(it, size))
         if not chunk:
             break
         yield chunk
 
-# --- Individual functions  ---
+
+# --- Individual functions ---
 def process_latam(url_info):
-    url = url_info["url"]
+    url = url_info["url"] if isinstance(url_info, dict) else url_info
     site = Browser_latam(url)
     try:
         site.load_page()
-        dados_voo = site.get_flight_info_latam()
-        for voo in dados_voo:
-            voo['solicitation_id'] = url_info['solicitation_id']
-        return dados_voo
+        return site.get_flight_info_latam()
     except Exception as e:
         print(f"Erro no latam ({url}): {e}")
+        return []
     finally:
         site.quit()
 
 
 def process_skipplagged(url_info):
-    url = url_info["url"]
+    url = url_info["url"] if isinstance(url_info, dict) else url_info
     site = Browser_skiplagged(url)
     try:
         site.load_page()
-        dados_voo = site.get_flights_info_skipplagged()
-        for voo in dados_voo:
-            voo['solicitation_id'] = url_info['solicitation_id']
-        return dados_voo
+        return site.get_flights_info_skipplagged()
     except Exception as e:
         print(f"Erro no skipplagged ({url}): {e}")
+        return []
     finally:
         site.quit()
+
 
 # --- Função de execução em batches ---
 def process_in_batchs(urls, funcao_processamento, batch_size=3):
@@ -72,11 +63,11 @@ def process_in_batchs(urls, funcao_processamento, batch_size=3):
                 resultado = future.result()
                 if resultado:
                     for r in resultado:
-                        producer.send('raw.flights_scrapy',value=r)
-                    print(f'it was send {len(resultado)} flights to kafka')
-                    
+                        producer.send('raw.flights_scrapy', value=r)
+                    print(f'it was sent {len(resultado)} flights to kafka')
+
+
 def run_scraping(payload):
-#    freeze_support()
     urls_latam = urls_builder.gerar_urls(urls_builder.build_latam_url, payload)
     urls_skip = urls_builder.gerar_urls(urls_builder.build_skiplagged_url, payload)
 
