@@ -1,3 +1,0 @@
-# Infra
-
-Docker infrastructure
