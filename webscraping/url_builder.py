@@ -2,7 +2,6 @@ from datetime import datetime, timedelta
 from typing import Callable, List, Dict 
 import inspect
 
-
 class urls_builder:
     def __init__(self, origin: str, destity: str, outbound_date: str):
         self.origin = origin 
@@ -10,6 +9,7 @@ class urls_builder:
         self.outbound_date = outbound_date
 
     # LATAM
+    @staticmethod
     def build_latam_url(origin, destination, outbound_date, adults=1, children=0, infants=0):
         """
         Generates a valid url for latam website (One Way).
@@ -39,7 +39,8 @@ class urls_builder:
         return url
 
         
-    def gerar_urls(build_url_func: Callable[..., str], data: Dict) -> List[Dict[str, str]]:
+    @staticmethod
+    def gerar_urls(build_url_func: Callable[..., str], data: Dict) -> List[str]:
         origem = data.get("flight_from")
         destino = data.get("flight_to")
         start_date_str = data.get("start_date")
@@ -70,22 +71,19 @@ class urls_builder:
                 **{date_param_name: formatted_date}
             )
 
-            urls.append({
-                "url": url,
-                "solicitation_id":data.get("solicitation_id")
-            })
+            # Retornando apenas a string da URL diretamente, sem solicitation_id
+            urls.append(url)
 
             current_date += delta
 
         return urls
         
-    
+    @staticmethod
     def build_skiplagged_url(origin: str, destination: str, departure_date: str) -> str:
         """
         origin: Origin IATA code (ex: 'THE')
         - destination: Destity IATA code (ex: 'GRU')
         - departure_date: outbound data on format 'YYYY-MM-DD'
         """
-
         base_url = "https://skiplagged.com/flights"
         return f"{base_url}/{origin.upper()}/{destination.upper()}/{departure_date}"
