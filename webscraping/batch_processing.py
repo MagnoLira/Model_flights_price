@@ -59,17 +59,3 @@ def run_scraping(payload):
     producer.flush()
     producer.close()
 
-
-if __name__ == "__main__":
-    freeze_support()
-    
-    payload_teste = {
-        "flight_from": "GRU",
-        "flight_to": "GYN",
-        "start_date": "2026-09-02",
-        "final_date": "2026-09-02"
-    }
-    
-    print("Iniciando o scraping de teste...")
-    run_scraping(payload_teste)
-    print("Scraping finalizado!")
