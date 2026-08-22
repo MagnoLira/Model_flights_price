@@ -10,7 +10,7 @@ from db_connection import get_lina_connection
 
 KAFKA_BOOTSTRAP_SERVERS = ['192.168.0.33:9092']
 KAFKA_TOPIC = 'raw.flights_scrapy'
-MODE = 'TESTING'  # ou 'PRODUCTION'
+MODE = 'PRODUCTION'  # ou 'PRODUCTION'
 
 # =======================
 # Setup do consumidor Kafka

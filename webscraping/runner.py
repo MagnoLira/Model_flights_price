@@ -4,9 +4,9 @@ import json
 
 from kafka import KafkaProducer
 
-from webscraping.browser_skiplagged import Browser_skiplagged
-from webscraping.url_builder import urls_builder
-from db_connection import get_connection
+from browser_skiplagged import Browser_skiplagged
+from url_builder import urls_builder
+from database.db_connection import get_lina_connection
 
 
 producer = KafkaProducer(
@@ -17,7 +17,7 @@ producer = KafkaProducer(
 
 def buscar_pares_aeroportos(aer_de):
 
-    conn = get_connection()
+    conn = get_lina_connection()
 
     try:
         cursor = conn.cursor()
