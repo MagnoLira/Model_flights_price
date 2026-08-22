@@ -2,7 +2,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from itertools import islice
 from datetime import datetime
 from multiprocessing import freeze_support
-from webscraping.browser_latam import Browser_latam
 from webscraping.browser_skiplagged import Browser_skiplagged
 from webscraping.url_builder import urls_builder
 import traceback
@@ -24,21 +23,6 @@ def chunked(iterable, size):
         if not chunk:
             break
         yield chunk
-
-
-# --- Individual functions ---
-def process_latam(url_info):
-    url = url_info["url"] if isinstance(url_info, dict) else url_info
-    site = Browser_latam(url)
-    try:
-        site.load_page()
-        return site.get_flight_info_latam()
-    except Exception as e:
-        print(f"Erro no latam ({url}): {e}")
-        return []
-    finally:
-        site.quit()
-
 
 def process_skipplagged(url_info):
     url = url_info["url"] if isinstance(url_info, dict) else url_info
@@ -68,11 +52,24 @@ def process_in_batchs(urls, funcao_processamento, batch_size=3):
 
 
 def run_scraping(payload):
-    urls_latam = urls_builder.gerar_urls(urls_builder.build_latam_url, payload)
     urls_skip = urls_builder.gerar_urls(urls_builder.build_skiplagged_url, payload)
 
-    process_in_batchs(urls_latam, process_latam, batch_size=3)
     process_in_batchs(urls_skip, process_skipplagged, batch_size=3)
 
     producer.flush()
     producer.close()
+
+
+if __name__ == "__main__":
+    freeze_support()
+    
+    payload_teste = {
+        "flight_from": "GRU",
+        "flight_to": "GYN",
+        "start_date": "2026-09-02",
+        "final_date": "2026-09-02"
+    }
+    
+    print("Iniciando o scraping de teste...")
+    run_scraping(payload_teste)
+    print("Scraping finalizado!")
