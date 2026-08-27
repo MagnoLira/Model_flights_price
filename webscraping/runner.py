@@ -1,176 +1,176 @@
+import json
+import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import freeze_support
-import json
+from datetime import datetime, timedelta
 
 from kafka import KafkaProducer
 
-from browser_skiplagged import Browser_skiplagged
-from url_builder import urls_builder
+from webscraping.browser_skiplagged import Browser_skiplagged
+from webscraping.url_builder import urls_builder
 from database.db_connection import get_lina_connection
 
+# ============================================================
+# CONFIGURAÇÕES DE LOTE E PAUSA
+# ============================================================
+
+MAX_WORKERS = 3
+TAMANHO_LOTE = 3       # Quantos pares de aeroportos pegar por vez
+TEMPO_PAUSA_LOTE = 180   # Segundos de descanso entre um lote e outro (para não tomar block)
+DIAS_A_FRENTE = 7       # Defina quantos dias a frente quer rodar (0 = só hoje)
+
+KAFKA_TOPIC = "raw.flights_scrapy"
 
 producer = KafkaProducer(
     bootstrap_servers="192.168.0.33:9092",
     value_serializer=lambda v: json.dumps(v).encode("utf-8")
 )
 
+# ============================================================
+# FUNÇÕES DE BANCO (CONTROLE DE LOTE)
+# ============================================================
+AEROPORTOS_VALIDOS = ['GRU', 'CGH', 'GIG', 'SDU', 'BSB', 'CNF', 'SSA', 'THE','GYN', 'VCP', 'SLZ', 'FOR', 'REC', 'POA', 'FLN']  # Coloque os IATA que você quer consultar
 
-def buscar_pares_aeroportos(aer_de):
-
+def buscar_lote_pendente(tamanho):
+    """Busca um lote de pares apenas dos aeroportos permitidos que ainda não foram rodados"""
     conn = get_lina_connection()
-
     try:
         cursor = conn.cursor()
-
-        query = """
-            SELECT
-                aer_de,
-                aer_para
+        
+        # Cria a string de placeholders para a query (%s, %s, %s...)
+        formatos = ','.join(['%s'] * len(AEROPORTOS_VALIDOS))
+        
+        query = f"""
+            SELECT aer_de, aer_para
             FROM flights.aeroportos_config
-            WHERE aer_de = %s
+            WHERE entra_busca = 'N' 
+              AND aer_para IS NOT NULL
+              AND aer_de IN ({formatos})
+            LIMIT %s
         """
-
-        cursor.execute(query, (aer_de,))
-
-        pares = cursor.fetchall()
-
-        return pares
-
+        
+        # Junta os aeroportos válidos com o tamanho do lote para os parâmetros da query
+        parametros = list(AEROPORTOS_VALIDOS) + [tamanho]
+        
+        cursor.execute(query, parametros)
+        return cursor.fetchall()
+    finally:
+        conn.close()
+def marcar_como_processado(pares):
+    """Atualiza o status dos pares que acabaram de rodar para 'S' (ou 'F')"""
+    if not pares:
+        return
+    
+    conn = get_lina_connection()
+    try:
+        cursor = conn.cursor()
+        # Monta a query para atualizar o lote processado
+        # pares é uma lista de tuplas [(aer_de, aer_para), ...]
+        query = """
+            UPDATE flights.aeroportos_config
+            SET entra_busca = 'S'
+            WHERE aer_de = %s AND aer_para = %s
+        """
+        cursor.executemany(query, pares)
+        conn.commit()
     finally:
         conn.close()
 
+# ============================================================
+# SCRAPING E DATAS (Igual ao seu)
+# ============================================================
 
-def process_skipplagged(url_info):
-
-    url = (
-        url_info["url"]
-        if isinstance(url_info, dict)
-        else url_info
-    )
-
+def process_skipplagged(url):
     site = Browser_skiplagged(url)
-
     try:
-
-        print(f"\nAbrindo: {url}")
-
         site.load_page()
-
-        voos = site.get_flights_info_skipplagged()
-
-        return voos
-
+        return site.get_flights_info_skipplagged()
     except Exception as e:
-
-        print(f"Erro no Skiplagged: {url}")
-        print(f"Detalhe: {e}")
-
+        print(f"Erro no Skiplagged: {url} | Detalhe: {e}")
         return []
-
     finally:
-
         site.quit()
 
-
 def processar_par(aer_de, aer_para, start_date):
-
-    payload = {
-        "flight_from": aer_de,
-        "flight_to": aer_para,
-        "start_date": start_date,
-        "final_date": start_date
-    }
-
-    url = urls_builder.build_skiplagged_url(payload)
-
-    print("=" * 70)
-    print(f"ROTA: {aer_de} -> {aer_para}")
-    print(f"URL: {url}")
-    print("=" * 70)
-
+    url = urls_builder.build_skiplagged_url(
+        origin=aer_de, destination=aer_para, departure_date=start_date
+    )
     resultado = process_skipplagged(url)
+    return aer_de, aer_para, start_date, resultado
 
-    return resultado
+def gerar_datas(data_inicial, dias_a_frente):
+    inicio = datetime.strptime(data_inicial, "%Y-%m-%d")
+    for i in range(dias_a_frente + 1):
+        data = inicio + timedelta(days=i)
+        yield data.strftime("%Y-%m-%d")
 
+# ============================================================
+# LOOP PRINCIPAL EM LOTES
+# ============================================================
 
-def run_scraping(aer_de, start_date, max_workers=3):
+def executar_sistema_em_lotes():
+    print("=" * 80)
+    print("INICIANDO PROCESSAMENTO EM LOTES COM PAUSA")
+    print("=" * 80)
 
-    pares = buscar_pares_aeroportos(aer_de)
+    data_inicial = datetime.now().strftime("%Y-%m-%d")
 
-    print(f"\nAeroporto de origem: {aer_de}")
-    print(f"Pares encontrados no banco: {len(pares)}")
+    while True:
+        # 1. Pega o próximo lote pendente do banco
+        pares_lote = buscar_lote_pendente(TAMANHO_LOTE)
 
-    for origem, destino in pares:
-        print(f"  {origem} -> {destino}")
+        if not pares_lote:
+            print("\n[SUCESSO] Todos os registros da tabela foram processados!")
+            break
 
-    tarefas = [
-        (origem, destino)
-        for origem, destino in pares
-    ]
+        print(f"\n--- [NOVO LOTE] Pegando {len(pares_lote)} pares do banco ---")
 
-    with ProcessPoolExecutor(
-        max_workers=max_workers
-    ) as executor:
+        # 2. Monta as tarefas para esse lote
+        tarefas = []
+        for aer_de, aer_para in pares_lote:
+            for data in gerar_datas(data_inicial, DIAS_A_FRENTE):
+                tarefas.append((aer_de, aer_para, data))
 
-        futures = {
-            executor.submit(
-                processar_par,
-                origem,
-                destino,
-                start_date
-            ): (origem, destino)
+        print(f"Total de requisições neste lote: {len(tarefas)}")
 
-            for origem, destino in tarefas
-        }
+        # 3. Executa o lote em paralelo com os workers
+        pares_processados_neste_lote = set()
+        
+        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {
+                executor.submit(processar_par, origem, destino, data): (origem, destino)
+                for origem, destino, data in tarefas
+            }
 
-        for future in as_completed(futures):
+            for future in as_completed(futures):
+                origem, destino = futures[future]
+                try:
+                    origem, destino, data, resultado = future.result()
+                    pares_processados_neste_lote.add((origem, destino))
 
-            origem, destino = futures[future]
+                    if resultado:
+                        for voo in resultado:
+                            producer.send(KAFKA_TOPIC, value=voo)
+                        producer.flush()
+                        print(f"[OK] {origem}->{destino} ({data}): {len(resultado)} enviados")
+                    else:
+                        print(f"[VAZIO] {origem}->{destino} ({data})")
 
-            try:
+                except Exception as e:
+                    print(f"[ERRO] {origem}->{destino}: {e}")
 
-                resultado = future.result()
+        # 4. Atualiza no banco que esses pares foram concluídos (muda para 'S')
+        marcar_como_processado(list(pares_processados_neste_lote))
+        print(f"[LOTE CONCLUÍDO] Pares atualizados no banco para 'S'.")
 
-                if resultado:
-
-                    for voo in resultado:
-                        producer.send(
-                            "raw.flights_scrapy",
-                            value=voo
-                        )
-
-                    print(
-                        f"[OK] {origem}->{destino}: "
-                        f"{len(resultado)} voos enviados"
-                    )
-
-                else:
-
-                    print(
-                        f"[VAZIO] {origem}->{destino}: "
-                        f"nenhum voo"
-                    )
-
-            except Exception as e:
-
-                print(
-                    f"[ERRO] {origem}->{destino}: {e}"
-                )
-
+        # 5. Pausa de respiro para o IP não cair em Block/CAPTCHA
+        print(f"Dormindo por {TEMPO_PAUSA_LOTE} segundos para respirar...")
+        time.sleep(TEMPO_PAUSA_LOTE)
 
 if __name__ == "__main__":
-
     freeze_support()
-
-    print("Iniciando scraping Skiplagged...")
-
-    run_scraping(
-        aer_de="GRU",
-        start_date="2026-09-02",
-        max_workers=3
-    )
-
-    producer.flush()
-    producer.close()
-
-    print("\nScraping finalizado!")
+    try:
+        executar_sistema_em_lotes()
+    finally:
+        producer.flush()
+        producer.close()
