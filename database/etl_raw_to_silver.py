@@ -31,217 +31,514 @@ for msg in consumer:
 
 
 
-
 from kafka import KafkaConsumer
 import json
 import logging
 import re
-from decimal import Decimal
+
+from decimal import Decimal, InvalidOperation
 from datetime import datetime
+from urllib.parse import urlparse
+
 from db_connection import get_lina_connection
 
-# Configura logs para debug
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("KafkaConsumer")
 
-# KAFKA VARIABLES
-KAFKA_TOPIC = 'lina.raw.flights_scrapy'
-KAFKA_BOOTSTRAP_SERVERS = ['192.168.0.33:9092']
+# ============================================================
+# CONFIG
+# ============================================================
 
-# DB CONNECTION 
-conn = get_lina_connection()
-cursor = conn.cursor()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s"
+)
 
-insert_query = """INSERT INTO silver.flights_scrapy (
-  id,
-  flight_from,
-  flight_to,
-  company,
-  exit_hour,
-  entry_hour,
-  miles_cost,
-  reais_cost,
-  emission_type,
-  ticket_date,
-  search_date,
-  emission_link,
-  website,
-  mode,
-  inserted_at
-) VALUES (%s, %s, %s, %s,%s, %s, %s, %s,%s, %s, %s, %s,%s, %s, %s)"""
+logger = logging.getLogger("silver-consumer")
 
-# Support function
-def to_date_or_none(value):
-    try:
-        return datetime.strptime(value, "%Y-%m-%d").date() if value else None
-    except:
-        return None
-def to_time_or_none(value):
-    try:
-        return datetime.strptime(value, "%H:%M").time() if value else None
-    except:
-        return None
-    
-# Support 
-def to_date_flex_or_none(value):
+KAFKA_TOPIC = "lina.raw.flights_scrapy"
+KAFKA_BOOTSTRAP_SERVERS = ["192.168.0.33:9092"]
+KAFKA_GROUP_ID = "silver-flight-group"
+
+
+# ============================================================
+# SQL
+# ============================================================
+
+INSERT_QUERY = """
+INSERT INTO silver.flights_scrapy (
+    raw_id,
+    flight_from,
+    flight_to,
+    company,
+    departure_time,
+    arrival_time,
+    duration_minutes,
+    stops,
+    self_transfer,
+    connection_airports,
+    price_original,
+    currency_original,
+    ticket_date,
+    search_timestamp,
+    emission_link,
+    website,
+    mode
+)
+VALUES (
+    %(raw_id)s,
+    %(flight_from)s,
+    %(flight_to)s,
+    %(company)s,
+    %(departure_time)s,
+    %(arrival_time)s,
+    %(duration_minutes)s,
+    %(stops)s,
+    %(self_transfer)s,
+    %(connection_airports)s,
+    %(price_original)s,
+    %(currency_original)s,
+    %(ticket_date)s,
+    %(search_timestamp)s,
+    %(emission_link)s,
+    %(website)s,
+    %(mode)s
+)
+ON CONFLICT (raw_id)
+DO NOTHING;
+"""
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def parse_datetime(value):
     if not value:
         return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+
+    for fmt in (
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d"
+    ):
         try:
-            return datetime.strptime(value, fmt).date()
+            return datetime.strptime(value, fmt)
         except ValueError:
-            continue
+            pass
+
     return None
-def to_time_flex_or_none(value):
+
+
+def parse_time(value):
     if not value:
         return None
+
+    value = value.strip().lower()
+
     for fmt in ("%I:%M%p", "%H:%M"):
         try:
-            return datetime.strptime(value.strip().lower(), fmt).time()
+            return datetime.strptime(value, fmt).time()
         except ValueError:
-            continue
+            pass
+
     return None
 
 
+def parse_date(value):
+    if not value:
+        return None
 
-def extract_from_link(url):
-    match = re.search(r"flights/([A-Z]{3})/([A-Z]{3})/(\d{4}-\d{2}-\d{2})", url)
-    return match.groups() if match else (None, None, None)
+    try:
+        return datetime.strptime(
+            value,
+            "%Y-%m-%d"
+        ).date()
 
-# class etl raw to silver
-class etl_raw_silver():
-    def __init__(self,payload):
-        after = payload.get("after")
-        self.raw_data = json.loads(after.get("data_json")) if after else {}
-        self.url = self.raw_data.get("link_emissao","")
-        self.website = self.raw_data.get("site","").lower()
-        self.data_busca =self.raw_data.get("data_busca")
-        self.mode = after.get("mode")
-        self.result = None
+    except ValueError:
+        return None
 
-    def transform(self):
-        if self.website == "latam":
-            return self.etl_latam()
-        elif self.website == "skiplagged":
-            return self.etl_skiplagged()
-        else:
-            logging.warning("Website não reconhecido: %s", self.website)
-    def etl_latam(self):
-        texto = self.raw_data.get("raw_text", "")
-        saida_hora = re.search(r'HORA DE SAÍDA (\d{1,2}:\d{2})', texto)
-        chegada_hora = re.search(r'HORA DE CHEGADA (\d{1,2}:\d{2})', texto)
-        valor = re.search(r'PREÇO DE UM ADULTO.*?([\d\.,]+)', texto)
-        companhia = re.search(r'OPERADO PELA (.+?)(?:\.|$)', texto)
-        aeroportos_raw = re.findall(r'AEROPORTO (.+?)\,|AEROPORTO (.+?)\.', texto)
-        data_match = re.search(r"outbound=(\d{4}-\d{2}-\d{2})T", self.url)
-        aeroportos_raw = re.findall(r'AEROPORTO ([^,.]+)', texto)
-        aeroportos = [a.strip().title() for a in aeroportos_raw]
 
-        if len(aeroportos) < 2:
-            logging.warning(f"Não foi possível extrair aeroportos de: {texto}")
-            return None
+def parse_decimal(value):
+    if value is None:
+        return None
 
-        self.result = {
-            "id": self.raw_data.get("id"),
-            "flight_from": aeroportos[0].strip().title(),
-            "flight_to": aeroportos[1].strip().title(),
-            "company": companhia.group(1) if companhia else None,
-            "exit_hour": to_time_or_none(saida_hora.group(1)) if saida_hora else None,
-            "entry_hour": to_time_or_none(chegada_hora.group(1)) if chegada_hora else None,
-            "miles_cost": None,
-            "reais_cost": int(float(valor.group(1).replace('.', '').replace(',', '.'))) if valor else None,
-            "emission_type": "milhas" if "milha" in texto.lower() else "dinheiro",
-            "ticket_date": to_date_or_none(data_match.group(1)) if data_match else None,
-            "search_date": to_date_flex_or_none(self.data_busca),
-            "emission_link": self.url,
-            "website": self.website,
-            "mode": self.mode,
-            "inserted_at": datetime.now().date()
-        }
-        return self.result 
+    try:
+        return Decimal(str(value))
+    except InvalidOperation:
+        return None
 
-    def etl_skiplagged(self):
-        aer_de, aer_para, data_passagem = extract_from_link(self.url)
-        texto = self.raw_data.get("raw_text", "")
 
-        
-        preco_bruto = self.raw_data.get("preco_bruto", "")
-        valor_reais = None
-        if preco_bruto:
-            try:
-                valor_limpo = re.sub(r"[^\d,]", "", preco_bruto).replace(",", ".")
-                valor_reais = Decimal(valor_limpo)
-            except:
-                pass
-        else:
-            valor_match = re.search(r"\$(\d+(?:\.\d{1,2})?)", texto)
-            if valor_match:
-                valor_reais = Decimal(valor_match.group(1))
+# ============================================================
+# URL
+# ============================================================
 
-        
-        horas = re.findall(r"\b\d{1,2}:\d{2}(?:am|pm)\b", texto, flags=re.IGNORECASE)
-        saida_raw = horas[0] if len(horas) >= 1 else None
-        chegada_raw = horas[-1] if len(horas) >= 2 else None
+def extract_flight_info_from_url(url):
 
-        self.result = {
-            "id": self.raw_data.get("id"),
-            "flight_from": aer_de,
-            "flight_to": aer_para,
-            "company": self.raw_data.get("companhia_bruta"),
-            "exit_hour": to_time_flex_or_none(saida_raw),
-            "entry_hour": to_time_flex_or_none(chegada_raw),
-            "miles_cost": None,
-            "reais_cost": int(valor_reais) if valor_reais else None,
-            "emission_type": "dinheiro",
-            "ticket_date": to_date_or_none(data_passagem),
-            "search_date": to_date_flex_or_none(self.raw_data.get("data_busca")),
-            "emission_link": self.url,
-            "website": self.website,
-            "mode": self.raw_data.get("mode"),
-            "inserted_at": datetime.now().date()
-        }
-        return self.result
-    
+    if not url:
+        return None, None, None
 
-# Kafka consumer
+    match = re.search(
+        r"/flights/"
+        r"([A-Z]{3})/"
+        r"([A-Z]{3})/"
+        r"(\d{4}-\d{2}-\d{2})",
+        url,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return None, None, None
+
+    origin, destination, flight_date = match.groups()
+
+    return (
+        origin.upper(),
+        destination.upper(),
+        parse_date(flight_date)
+    )
+
+
+# ============================================================
+# RAW TEXT
+# ============================================================
+
+def extract_duration_minutes(text):
+
+    if not text:
+        return None
+
+    match = re.search(
+        r"(?<!\d)"
+        r"(\d+)\s*h"
+        r"(?:\s*(\d+)\s*m)?",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        hours = int(match.group(1))
+        minutes = int(match.group(2) or 0)
+
+        return hours * 60 + minutes
+
+    match = re.search(
+        r"(?<!\d)(\d+)\s*m(?!\w)",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return int(match.group(1))
+
+    return None
+
+
+def extract_stops(text):
+
+    if not text:
+        return None
+
+    match = re.search(
+        r"\b(\d+)\s+stops?\b",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return int(match.group(1))
+
+    if re.search(
+        r"\bnonstop\b|\bnon-stop\b",
+        text,
+        re.IGNORECASE
+    ):
+        return 0
+
+    return None
+
+
+def extract_self_transfer(text):
+
+    if not text:
+        return False
+
+    return bool(
+        re.search(
+            r"self[\s-]?transfer",
+            text,
+            re.IGNORECASE
+        )
+    )
+
+
+def extract_price(text, preco_bruto=None):
+
+    # usa campo estruturado primeiro
+    if preco_bruto:
+        cleaned = re.sub(
+            r"[^\d.,]",
+            "",
+            str(preco_bruto)
+        )
+
+        try:
+            return Decimal(cleaned)
+        except InvalidOperation:
+            pass
+
+    # fallback para raw_text
+    match = re.search(
+        r"\$\s*([\d,.]+)",
+        text or ""
+    )
+
+    if not match:
+        return None
+
+    value = match.group(1).replace(",", "")
+
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        return None
+
+
+def extract_connection_airports(
+    text,
+    origin,
+    destination
+):
+
+    if not text:
+        return []
+
+    codes = re.findall(
+        r"(?m)^\s*([A-Z]{3})\s*$",
+        text
+    )
+
+    connections = []
+
+    for code in codes:
+
+        code = code.upper()
+
+        if code in (origin, destination):
+            continue
+
+        if code not in connections:
+            connections.append(code)
+
+    return connections
+
+
+# ============================================================
+# TRANSFORM
+# ============================================================
+
+def transform(payload):
+
+    after = payload.get("after")
+
+    if not after:
+        return None
+
+    op = payload.get("op")
+
+    if op not in ("c", "r", "u"):
+        return None
+
+    raw_id = after.get("id")
+
+    data_json = after.get("data_json")
+
+    if not data_json:
+        return None
+
+    try:
+        raw_data = (
+            json.loads(data_json)
+            if isinstance(data_json, str)
+            else data_json
+        )
+
+    except json.JSONDecodeError:
+        logger.exception("data_json inválido")
+        return None
+
+    website = (
+        raw_data
+        .get("site", "")
+        .strip()
+        .lower()
+    )
+
+    if website != "skiplagged":
+        return None
+
+    text = raw_data.get("raw_text", "")
+    url = raw_data.get("link_emissao", "")
+
+    origin, destination, ticket_date = (
+        extract_flight_info_from_url(url)
+    )
+
+    result = {
+        "raw_id": raw_id,
+
+        "flight_from": origin,
+        "flight_to": destination,
+
+        "company": raw_data.get(
+            "companhia_bruta"
+        ),
+
+        "departure_time": parse_time(
+            raw_data.get("hora_saida_bruta")
+        ),
+
+        "arrival_time": parse_time(
+            raw_data.get("hora_chegada_bruta")
+        ),
+
+        "duration_minutes":
+            extract_duration_minutes(text),
+
+        "stops":
+            extract_stops(text),
+
+        "self_transfer":
+            extract_self_transfer(text),
+
+        "connection_airports":
+            extract_connection_airports(
+                text,
+                origin,
+                destination
+            ),
+
+        "price_original":
+            extract_price(
+                text,
+                raw_data.get("preco_bruto")
+            ),
+
+        "currency_original": "USD",
+
+        "ticket_date": ticket_date,
+
+        "search_timestamp":
+            parse_datetime(
+                raw_data.get("data_busca")
+            ),
+
+        "emission_link": url,
+
+        "website": website,
+
+        "mode": after.get("mode")
+    }
+
+    return result
+
+
+# ============================================================
+# CONSUMER
+# ============================================================
+
+def create_consumer():
+
+    return KafkaConsumer(
+        KAFKA_TOPIC,
+
+        bootstrap_servers=(
+            KAFKA_BOOTSTRAP_SERVERS
+        ),
+
+        value_deserializer=lambda m: (
+            json.loads(
+                m.decode("utf-8")
+            )
+        ),
+
+        auto_offset_reset="earliest",
+
+        enable_auto_commit=False,
+
+        group_id=KAFKA_GROUP_ID
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
 def run_consumer():
-    consumer = KafkaConsumer(
-    KAFKA_TOPIC,
-    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-    value_deserializer=lambda m: json.loads(m.decode('utf-8')),
-    auto_offset_reset='earliest',
-    enable_auto_commit=True,
-    group_id='silver-flight-group')
-    print(f"Consumindo do tópico '{KAFKA_TOPIC}'...\n")
-    for msg in consumer:
-        payload = msg.value
-        process = etl_raw_silver(payload)
-        result = process.transform()
-        if result:
+
+    consumer = create_consumer()
+
+    conn = get_lina_connection()
+
+    logger.info(
+        "Consumindo tópico %s",
+        KAFKA_TOPIC
+    )
+
+    try:
+
+        for msg in consumer:
+
             try:
-                cursor.execute(insert_query, (
-                    result["id"],
+
+                result = transform(
+                    msg.value
+                )
+
+                if not result:
+
+                    consumer.commit()
+                    continue
+
+                with conn.cursor() as cursor:
+
+                    cursor.execute(
+                        INSERT_QUERY,
+                        result
+                    )
+
+                conn.commit()
+
+                # só confirma Kafka depois
+                # do PostgreSQL
+                consumer.commit()
+
+                logger.info(
+                    (
+                        "Silver inserida | "
+                        "%s -> %s | "
+                        "%s USD | "
+                        "%s"
+                    ),
                     result["flight_from"],
                     result["flight_to"],
-                    result["company"],
-                    result["exit_hour"],
-                    result["entry_hour"],
-                    result["miles_cost"],
-                    result["reais_cost"],
-                    result["emission_type"],
-                    result["ticket_date"],
-                    result["search_date"],
-                    result["emission_link"],
-                    result["website"],
-                    result["mode"],
-                    result["inserted_at"]
-                ))
-                conn.commit()
-                print("Registro inserido com sucesso!\n")
-            except Exception as e:
-                logging.error(f"Erro ao inserir no banco: {e}")
+                    result["price_original"],
+                    result["ticket_date"]
+                )
+
+            except Exception:
+
+                logger.exception(
+                    "Erro processando mensagem"
+                )
+
                 conn.rollback()
-        else:
-            print("Mensagem descartada ou sem transformações aplicáveis.\n")
+
+                # não faz commit Kafka
+
+    finally:
+
+        consumer.close()
+        conn.close()
+
+
 if __name__ == "__main__":
     run_consumer()
