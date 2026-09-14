@@ -17,7 +17,7 @@ from database.db_connection import get_lina_connection
 MAX_WORKERS = 3
 TAMANHO_LOTE = 3       # Quantos pares de aeroportos pegar por vez
 TEMPO_PAUSA_LOTE = 180   # Segundos de descanso entre um lote e outro (para não tomar block)
-DIAS_A_FRENTE = 7       # Defina quantos dias a frente quer rodar (0 = só hoje)
+DIAS_A_FRENTE = 2       # Defina quantos dias a frente quer rodar (0 = só hoje)
 
 KAFKA_TOPIC = "raw.flights_scrapy"
 
@@ -29,7 +29,10 @@ producer = KafkaProducer(
 # ============================================================
 # FUNÇÕES DE BANCO (CONTROLE DE LOTE)
 # ============================================================
-AEROPORTOS_VALIDOS = ['GRU', 'CGH', 'GIG', 'SDU', 'BSB', 'CNF', 'SSA', 'THE','GYN', 'VCP', 'SLZ', 'FOR', 'REC', 'POA', 'FLN']  # Coloque os IATA que você quer consultar
+AEROPORTOS_VALIDOS = ['CNF', 'CWB', 'NAT', 'JPA', 'MCZ', 'AJU', 'MAO', 'BEL',
+'CGB', 'CGR', 'IGU', 'BPS', 'IOS', 'JOI', 'NVT', 'CXJ',
+'JDO', 'PMW', 'RBR', 'PVH', 'BVB', 'STM', 'MCP', 'IMP',
+'RAO', 'SJP', 'UDI', 'GYN', 'LDB', 'MGF']  # Coloque os IATA que você quer consultar
 
 def buscar_lote_pendente(tamanho):
     """Busca um lote de pares apenas dos aeroportos permitidos que ainda não foram rodados"""
