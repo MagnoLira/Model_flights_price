@@ -5,13 +5,15 @@ import hashlib
 from datetime import datetime
 
 from db_connection import get_lina_connection
+from load_dotenv import load_dotenv
 
+load_dotenv()  # Load environment variables from .env file
 
 # =======================
 # Configurações
 # =======================
 
-KAFKA_BOOTSTRAP_SERVERS = ['192.168.0.33:9092']
+KAFKA_BOOTSTRAP_SERVERS = [f'{os.getenv("host")}:9092']
 KAFKA_TOPIC = 'raw.flights_scrapy'
 
 MODE = 'PRODUCTION'
