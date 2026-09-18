@@ -1,1 +1,5 @@
 /venv
+.tsv
+.cbm
+.joblib
+.env
