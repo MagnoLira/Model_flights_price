@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+
+metadata:
+  name: flight-price-api
+
+spec:
+  replicas: 2
+
+  selector:
+    matchLabels:
+      app: flight-price-api
+
+  template:
+    metadata:
+      labels:
+        app: flight-price-api
+
+    spec:
+      containers:
+        - name: flight-price-api
+          image: docker.io/library/flight-price-api:v1
+          imagePullPolicy: Never
+
+          ports:
+            - containerPort: 8000
+
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 3
+            periodSeconds: 10
+
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 20
+
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "256Mi"
+            limits:
+              cpu: "500m"
+              memory: "1Gi"
