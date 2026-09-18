@@ -1,15 +1,18 @@
 import psycopg2
+from load_dotenv import load_dotenv
+import os
 
+load_dotenv()  # Load environment variables from .env file
 
 def get_lina_connection():
     """Creates and returns a database connection."""
     try:
         POSTGRES_CONFIG = {
             'dbname': 'models_price',
-            'user': 'postgres',
-            'password': 'postgres',
-            'host': '192.168.0.33',
-            'port': '5432'
+            'user': os.getenv('user'),
+            'password': os.getenv('password'),
+            'host': os.getenv('host'),
+            'port': os.getenv('port')
         }
         
         # Connect to the database
