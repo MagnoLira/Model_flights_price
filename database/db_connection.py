@@ -1,5 +1,5 @@
 import psycopg2
-from load_dotenv import load_dotenv
+from dotenv import load_dotenv
 import os
 
 load_dotenv()  # Load environment variables from .env file

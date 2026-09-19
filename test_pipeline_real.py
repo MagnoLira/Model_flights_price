@@ -12,7 +12,7 @@ from kafka import KafkaProducer
 from database.db_connection import get_lina_connection
 from webscraping.browser_skiplagged import Browser_skiplagged
 from webscraping.url_builder import urls_builder
-from load_dotenv import load_dotenv
+from dotenv import load_dotenv
 import os
 
 

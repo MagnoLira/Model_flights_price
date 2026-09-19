@@ -5,7 +5,7 @@ import hashlib
 from datetime import datetime
 
 from db_connection import get_lina_connection
-from load_dotenv import load_dotenv
+from dotenv import load_dotenv
 
 load_dotenv()  # Load environment variables from .env file
 
