@@ -6,6 +6,7 @@ from datetime import datetime
 
 from db_connection import get_lina_connection
 from dotenv import load_dotenv
+import os 
 
 load_dotenv()  # Load environment variables from .env file
 
