@@ -1,8 +1,8 @@
 import json
+import random
 import time
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import freeze_support
 from datetime import datetime, timedelta
+from multiprocessing import freeze_support
 
 from kafka import KafkaProducer
 
@@ -10,170 +10,805 @@ from webscraping.browser_skiplagged import Browser_skiplagged
 from webscraping.url_builder import urls_builder
 from database.db_connection import get_lina_connection
 
-# ============================================================
-# CONFIGURAÇÕES DE LOTE E PAUSA
-# ============================================================
 
-MAX_WORKERS = 3
-TAMANHO_LOTE = 3       # Quantos pares de aeroportos pegar por vez
-TEMPO_PAUSA_LOTE = 180   # Segundos de descanso entre um lote e outro (para não tomar block)
-DIAS_A_FRENTE = 2       # Defina quantos dias a frente quer rodar (0 = só hoje)
+# ============================================================
+# CONFIGURAÇÃO
+# ============================================================
 
 KAFKA_TOPIC = "raw.flights_scrapy"
 
+# ------------------------------------------------------------
+# Horizonte de compra
+#
+# Não fazemos 0,1,2,3,...,60.
+# Queremos pontos representativos sem massacrar o site.
+# ------------------------------------------------------------
+
+HORIZONTES_DIAS = [
+    1,
+    3,
+    7,
+    14,
+    30,
+    60,
+]
+
+
+# ------------------------------------------------------------
+# Pausas
+#
+# Intencionalmente conservadoras.
+# ------------------------------------------------------------
+
+# Entre duas consultas da mesma rota
+PAUSA_ENTRE_DATAS_MIN = 35
+PAUSA_ENTRE_DATAS_MAX = 70
+
+# Depois de terminar uma rota
+PAUSA_ENTRE_ROTAS_MIN = 180
+PAUSA_ENTRE_ROTAS_MAX = 300
+
+# Depois de terminar uma rodada completa
+# 6 horas
+PAUSA_ENTRE_CICLOS = 6 * 60 * 60
+
+
+# ------------------------------------------------------------
+# Quantidade de pares retirada do banco por vez
+#
+# Deixamos 1 porque não queremos paralelismo agressivo.
+# ------------------------------------------------------------
+
+TAMANHO_LOTE = 1
+
+
+# ============================================================
+# AEROPORTOS
+# ============================================================
+
+#
+# Um conjunto suficientemente diverso, mas não gigantesco.
+#
+# Inclui:
+# - grandes hubs
+# - Nordeste
+# - Norte
+# - Sul
+# - Centro-Oeste
+# - alguns regionais
+#
+
+AEROPORTOS_VALIDOS = [
+
+    # São Paulo
+    "GRU",
+    "CGH",
+    "VCP",
+
+    # Rio
+    "GIG",
+    "SDU",
+
+    # Grandes hubs
+    "BSB",
+    "CNF",
+
+    # Nordeste
+    "FOR",
+    "REC",
+    "SSA",
+    "NAT",
+    "JPA",
+    "MCZ",
+    "AJU",
+    "THE",
+    "SLZ",
+
+    # Norte
+    "MAO",
+    "BEL",
+
+    # Sul
+    "POA",
+    "FLN",
+    "CWB",
+
+    # Centro-Oeste
+    "GYN",
+    "CGB",
+    "CGR",
+]
+
+
+# ============================================================
+# KAFKA
+# ============================================================
+
 producer = KafkaProducer(
+
     bootstrap_servers="192.168.0.33:9092",
-    value_serializer=lambda v: json.dumps(v).encode("utf-8")
+
+    value_serializer=lambda v: (
+        json.dumps(
+            v,
+            ensure_ascii=False
+        ).encode("utf-8")
+    ),
+
+    acks="all",
 )
 
-# ============================================================
-# FUNÇÕES DE BANCO (CONTROLE DE LOTE)
-# ============================================================
-AEROPORTOS_VALIDOS = ['CNF', 'CWB', 'NAT', 'JPA', 'MCZ', 'AJU', 'MAO', 'BEL',
-'CGB', 'CGR', 'IGU', 'BPS', 'IOS', 'JOI', 'NVT', 'CXJ',
-'JDO', 'PMW', 'RBR', 'PVH', 'BVB', 'STM', 'MCP', 'IMP',
-'RAO', 'SJP', 'UDI', 'GYN', 'LDB', 'MGF']  # Coloque os IATA que você quer consultar
 
-def buscar_lote_pendente(tamanho):
-    """Busca um lote de pares apenas dos aeroportos permitidos que ainda não foram rodados"""
+# ============================================================
+# HELPERS
+# ============================================================
+
+def dormir_aleatorio(
+    minimo,
+    maximo,
+    motivo
+):
+
+    segundos = random.randint(
+        minimo,
+        maximo
+    )
+
+    print(
+        f"[PAUSA] {motivo}: "
+        f"{segundos} segundos"
+    )
+
+    time.sleep(
+        segundos
+    )
+
+
+# ============================================================
+# BANCO
+# ============================================================
+
+def buscar_lote_pendente(
+    tamanho
+):
+
+    """
+    Busca rotas que ainda não foram processadas
+    nesta rodada.
+
+    Tanto origem quanto destino precisam estar
+    dentro da lista permitida.
+    """
+
     conn = get_lina_connection()
+
     try:
+
         cursor = conn.cursor()
-        
-        # Cria a string de placeholders para a query (%s, %s, %s...)
-        formatos = ','.join(['%s'] * len(AEROPORTOS_VALIDOS))
-        
+
+        placeholders_origem = ",".join(
+            ["%s"]
+            * len(
+                AEROPORTOS_VALIDOS
+            )
+        )
+
+        placeholders_destino = ",".join(
+            ["%s"]
+            * len(
+                AEROPORTOS_VALIDOS
+            )
+        )
+
         query = f"""
-            SELECT aer_de, aer_para
+            SELECT
+                aer_de,
+                aer_para
+
             FROM flights.aeroportos_config
-            WHERE entra_busca = 'N' 
+
+            WHERE entra_busca = 'N'
+
               AND aer_para IS NOT NULL
-              AND aer_de IN ({formatos})
+
+              AND aer_de <> aer_para
+
+              AND aer_de IN (
+                  {placeholders_origem}
+              )
+
+              AND aer_para IN (
+                  {placeholders_destino}
+              )
+
+            ORDER BY
+                aer_de,
+                aer_para
+
             LIMIT %s
         """
-        
-        # Junta os aeroportos válidos com o tamanho do lote para os parâmetros da query
-        parametros = list(AEROPORTOS_VALIDOS) + [tamanho]
-        
-        cursor.execute(query, parametros)
+
+        parametros = (
+            list(
+                AEROPORTOS_VALIDOS
+            )
+            +
+            list(
+                AEROPORTOS_VALIDOS
+            )
+            +
+            [tamanho]
+        )
+
+        cursor.execute(
+            query,
+            parametros
+        )
+
         return cursor.fetchall()
+
     finally:
+
         conn.close()
-def marcar_como_processado(pares):
-    """Atualiza o status dos pares que acabaram de rodar para 'S' (ou 'F')"""
-    if not pares:
-        return
-    
+
+
+def marcar_como_processado(
+    aer_de,
+    aer_para
+):
+
     conn = get_lina_connection()
+
     try:
+
         cursor = conn.cursor()
-        # Monta a query para atualizar o lote processado
-        # pares é uma lista de tuplas [(aer_de, aer_para), ...]
-        query = """
+
+        cursor.execute(
+            """
             UPDATE flights.aeroportos_config
+
             SET entra_busca = 'S'
-            WHERE aer_de = %s AND aer_para = %s
-        """
-        cursor.executemany(query, pares)
+
+            WHERE aer_de = %s
+              AND aer_para = %s
+            """,
+            (
+                aer_de,
+                aer_para
+            )
+        )
+
         conn.commit()
+
     finally:
+
         conn.close()
 
-# ============================================================
-# SCRAPING E DATAS (Igual ao seu)
-# ============================================================
 
-def process_skipplagged(url):
-    site = Browser_skiplagged(url)
+def resetar_ciclo():
+
+    """
+    Quando todos os pares terminarem,
+    libera novamente as rotas para uma
+    nova rodada futura.
+
+    Não cria nenhuma coluna nova.
+    """
+
+    conn = get_lina_connection()
+
     try:
-        site.load_page()
-        return site.get_flights_info_skipplagged()
-    except Exception as e:
-        print(f"Erro no Skiplagged: {url} | Detalhe: {e}")
-        return []
+
+        cursor = conn.cursor()
+
+        placeholders_origem = ",".join(
+            ["%s"]
+            * len(
+                AEROPORTOS_VALIDOS
+            )
+        )
+
+        placeholders_destino = ",".join(
+            ["%s"]
+            * len(
+                AEROPORTOS_VALIDOS
+            )
+        )
+
+        query = f"""
+            UPDATE flights.aeroportos_config
+
+            SET entra_busca = 'N'
+
+            WHERE entra_busca = 'S'
+
+              AND aer_de IN (
+                  {placeholders_origem}
+              )
+
+              AND aer_para IN (
+                  {placeholders_destino}
+              )
+        """
+
+        parametros = (
+            list(
+                AEROPORTOS_VALIDOS
+            )
+            +
+            list(
+                AEROPORTOS_VALIDOS
+            )
+        )
+
+        cursor.execute(
+            query,
+            parametros
+        )
+
+        atualizados = cursor.rowcount
+
+        conn.commit()
+
+        print(
+            f"[RESET] "
+            f"{atualizados} pares "
+            f"voltaram para N."
+        )
+
     finally:
-        site.quit()
 
-def processar_par(aer_de, aer_para, start_date):
-    url = urls_builder.build_skiplagged_url(
-        origin=aer_de, destination=aer_para, departure_date=start_date
+        conn.close()
+
+
+# ============================================================
+# SCRAPER
+# ============================================================
+
+def process_skipplagged(
+    url
+):
+
+    site = Browser_skiplagged(
+        url
     )
-    resultado = process_skipplagged(url)
-    return aer_de, aer_para, start_date, resultado
 
-def gerar_datas(data_inicial, dias_a_frente):
-    inicio = datetime.strptime(data_inicial, "%Y-%m-%d")
-    for i in range(dias_a_frente + 1):
-        data = inicio + timedelta(days=i)
-        yield data.strftime("%Y-%m-%d")
+    try:
+
+        site.load_page()
+
+        return (
+            site
+            .get_flights_info_skipplagged()
+        )
+
+    except Exception as e:
+
+        print(
+            f"[ERRO SCRAPER] "
+            f"{url} | {e}"
+        )
+
+        return []
+
+    finally:
+
+        try:
+
+            site.quit()
+
+        except Exception:
+
+            pass
+
 
 # ============================================================
-# LOOP PRINCIPAL EM LOTES
+# DATAS
 # ============================================================
 
-def executar_sistema_em_lotes():
-    print("=" * 80)
-    print("INICIANDO PROCESSAMENTO EM LOTES COM PAUSA")
+def gerar_datas():
+
+    hoje = datetime.now()
+
+    for horizonte in HORIZONTES_DIAS:
+
+        data = (
+            hoje
+            + timedelta(
+                days=horizonte
+            )
+        )
+
+        yield (
+            horizonte,
+            data.strftime(
+                "%Y-%m-%d"
+            )
+        )
+
+
+# ============================================================
+# KAFKA
+# ============================================================
+
+def enviar_para_kafka(
+    voos
+):
+
+    enviados = 0
+
+    for voo in voos:
+
+        future = producer.send(
+            KAFKA_TOPIC,
+            value=voo
+        )
+
+        # Espera confirmação do broker.
+        # Se der erro, não fingimos que enviou.
+        future.get(
+            timeout=30
+        )
+
+        enviados += 1
+
+    producer.flush()
+
+    return enviados
+
+
+# ============================================================
+# PROCESSAMENTO DE UMA ROTA
+# ============================================================
+
+def processar_rota(
+    origem,
+    destino
+):
+
+    print()
     print("=" * 80)
 
-    data_inicial = datetime.now().strftime("%Y-%m-%d")
+    print(
+        f"ROTA: "
+        f"{origem} -> {destino}"
+    )
+
+    print("=" * 80)
+
+    consultas_ok = 0
+    consultas_vazias = 0
+    consultas_erro = 0
+
+    for indice, (
+        horizonte,
+        data
+    ) in enumerate(
+        gerar_datas()
+    ):
+
+        print()
+
+        print(
+            f"[CONSULTA] "
+            f"{origem}->{destino} | "
+            f"D+{horizonte} | "
+            f"{data}"
+        )
+
+        try:
+
+            url = (
+                urls_builder
+                .build_skiplagged_url(
+                    origin=origem,
+                    destination=destino,
+                    departure_date=data
+                )
+            )
+
+            resultado = (
+                process_skipplagged(
+                    url
+                )
+            )
+
+            if resultado:
+
+                enviados = (
+                    enviar_para_kafka(
+                        resultado
+                    )
+                )
+
+                consultas_ok += 1
+
+                print(
+                    f"[OK] "
+                    f"{origem}->{destino} | "
+                    f"D+{horizonte} | "
+                    f"{enviados} voos enviados"
+                )
+
+            else:
+
+                consultas_vazias += 1
+
+                print(
+                    f"[VAZIO] "
+                    f"{origem}->{destino} | "
+                    f"D+{horizonte}"
+                )
+
+        except Exception as e:
+
+            consultas_erro += 1
+
+            print(
+                f"[ERRO] "
+                f"{origem}->{destino} | "
+                f"D+{horizonte} | "
+                f"{e}"
+            )
+
+        # ----------------------------------------------------
+        # Não dorme depois da última data,
+        # pois teremos a pausa maior da rota.
+        # ----------------------------------------------------
+
+        if indice < (
+            len(
+                HORIZONTES_DIAS
+            )
+            - 1
+        ):
+
+            dormir_aleatorio(
+                PAUSA_ENTRE_DATAS_MIN,
+                PAUSA_ENTRE_DATAS_MAX,
+                (
+                    f"entre consultas "
+                    f"{origem}->{destino}"
+                )
+            )
+
+    print()
+
+    print(
+        f"[RESUMO ROTA] "
+        f"{origem}->{destino} | "
+        f"OK={consultas_ok} | "
+        f"VAZIO={consultas_vazias} | "
+        f"ERRO={consultas_erro}"
+    )
+
+    return {
+        "ok":
+            consultas_ok,
+
+        "vazio":
+            consultas_vazias,
+
+        "erro":
+            consultas_erro,
+    }
+
+
+# ============================================================
+# CICLO
+# ============================================================
+
+def executar_ciclo():
+
+    total_rotas = 0
 
     while True:
-        # 1. Pega o próximo lote pendente do banco
-        pares_lote = buscar_lote_pendente(TAMANHO_LOTE)
 
-        if not pares_lote:
-            print("\n[SUCESSO] Todos os registros da tabela foram processados!")
-            break
+        pares = buscar_lote_pendente(
+            TAMANHO_LOTE
+        )
 
-        print(f"\n--- [NOVO LOTE] Pegando {len(pares_lote)} pares do banco ---")
+        if not pares:
 
-        # 2. Monta as tarefas para esse lote
-        tarefas = []
-        for aer_de, aer_para in pares_lote:
-            for data in gerar_datas(data_inicial, DIAS_A_FRENTE):
-                tarefas.append((aer_de, aer_para, data))
+            print()
 
-        print(f"Total de requisições neste lote: {len(tarefas)}")
+            print("=" * 80)
 
-        # 3. Executa o lote em paralelo com os workers
-        pares_processados_neste_lote = set()
-        
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = {
-                executor.submit(processar_par, origem, destino, data): (origem, destino)
-                for origem, destino, data in tarefas
-            }
+            print(
+                "[CICLO CONCLUÍDO] "
+                "Nenhuma rota pendente."
+            )
 
-            for future in as_completed(futures):
-                origem, destino = futures[future]
-                try:
-                    origem, destino, data, resultado = future.result()
-                    pares_processados_neste_lote.add((origem, destino))
+            print("=" * 80)
 
-                    if resultado:
-                        for voo in resultado:
-                            producer.send(KAFKA_TOPIC, value=voo)
-                        producer.flush()
-                        print(f"[OK] {origem}->{destino} ({data}): {len(resultado)} enviados")
-                    else:
-                        print(f"[VAZIO] {origem}->{destino} ({data})")
+            return total_rotas
 
-                except Exception as e:
-                    print(f"[ERRO] {origem}->{destino}: {e}")
+        for (
+            origem,
+            destino
+        ) in pares:
 
-        # 4. Atualiza no banco que esses pares foram concluídos (muda para 'S')
-        marcar_como_processado(list(pares_processados_neste_lote))
-        print(f"[LOTE CONCLUÍDO] Pares atualizados no banco para 'S'.")
+            try:
 
-        # 5. Pausa de respiro para o IP não cair em Block/CAPTCHA
-        print(f"Dormindo por {TEMPO_PAUSA_LOTE} segundos para respirar...")
-        time.sleep(TEMPO_PAUSA_LOTE)
+                resultado = processar_rota(
+                    origem,
+                    destino
+                )
+
+                # ------------------------------------------------
+                # Só marca como concluída depois que tentamos
+                # TODOS os horizontes daquela rota.
+                #
+                # Mesmo consultas vazias contam como tentativa.
+                # ------------------------------------------------
+
+                marcar_como_processado(
+                    origem,
+                    destino
+                )
+
+                total_rotas += 1
+
+                print(
+                    f"[ROTA FINALIZADA] "
+                    f"{origem}->{destino}"
+                )
+
+            except Exception as e:
+
+                # Não marca S.
+                # Na próxima passagem ela pode ser tentada novamente.
+                print(
+                    f"[ERRO FATAL ROTA] "
+                    f"{origem}->{destino} | "
+                    f"{e}"
+                )
+
+            # ------------------------------------------------
+            # Pausa grande entre rotas
+            # ------------------------------------------------
+
+            dormir_aleatorio(
+                PAUSA_ENTRE_ROTAS_MIN,
+                PAUSA_ENTRE_ROTAS_MAX,
+                "entre rotas"
+            )
+
+
+# ============================================================
+# LOOP CONTÍNUO
+# ============================================================
+
+def executar_historico():
+
+    print("=" * 80)
+
+    print(
+        "COLETOR HISTÓRICO DE PREÇOS"
+    )
+
+    print("=" * 80)
+
+    print(
+        "Horizontes:",
+        HORIZONTES_DIAS
+    )
+
+    print(
+        "Aeroportos:",
+        len(
+            AEROPORTOS_VALIDOS
+        )
+    )
+
+    print(
+        "Paralelismo: DESATIVADO"
+    )
+
+    print(
+        "Consultas são executadas "
+        "uma por vez."
+    )
+
+    while True:
+
+        inicio = datetime.now()
+
+        print()
+        print("=" * 80)
+
+        print(
+            "[NOVO CICLO]",
+            inicio.strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        )
+
+        print("=" * 80)
+
+        try:
+
+            total_rotas = (
+                executar_ciclo()
+            )
+
+            print(
+                f"[CICLO] "
+                f"{total_rotas} rotas "
+                f"processadas."
+            )
+
+        except Exception as e:
+
+            print(
+                f"[ERRO CICLO] {e}"
+            )
+
+            # Se algo estrutural der errado,
+            # não fica martelando serviço/banco/site.
+            print(
+                "[SEGURANÇA] "
+                "Dormindo 30 minutos."
+            )
+
+            time.sleep(
+                30 * 60
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Rodada terminou.
+        #
+        # Não reseta e começa imediatamente.
+        # Primeiro descansamos várias horas.
+        # ----------------------------------------------------
+
+        print()
+
+        print(
+            "[DESCANSO] "
+            f"Ciclo completo. "
+            f"Dormindo "
+            f"{PAUSA_ENTRE_CICLOS / 3600:.1f} horas."
+        )
+
+        time.sleep(
+            PAUSA_ENTRE_CICLOS
+        )
+
+        # ----------------------------------------------------
+        # Depois do descanso, libera nova rodada.
+        # ----------------------------------------------------
+
+        resetar_ciclo()
+
+
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
 if __name__ == "__main__":
+
     freeze_support()
+
     try:
-        executar_sistema_em_lotes()
+
+        executar_historico()
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "[STOP] Encerramento manual."
+        )
+
     finally:
-        producer.flush()
-        producer.close()
+
+        try:
+
+            producer.flush()
+
+        finally:
+
+            producer.close()
