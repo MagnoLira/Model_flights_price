@@ -10,10 +10,39 @@ from catboost import CatBoostRegressor
 from sklearn.metrics import (
     mean_absolute_error,
     mean_squared_error,
-    r2_score
+    r2_score,
+    mean_absolute_percentage_error,
 )
 
 from database.db_connection import get_lina_connection
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("train-flight-price-v6")
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+RANDOM_SEED = 42
+
+MIN_WARM_ROUTE_SAMPLES = 10
+MIN_WARM_ROUTE_BATCHES = 3
+
+WARM_TRAIN_RATIO = 0.70
+WARM_VALIDATION_RATIO = 0.15
+
+COLD_TRAIN_ROUTE_RATIO = 0.70
+COLD_VALIDATION_ROUTE_RATIO = 0.15
 
 
 # ============================================================
@@ -26,81 +55,46 @@ MODEL_DIR = BASE_DIR / "models"
 
 COLD_MODEL_PATH = (
     MODEL_DIR
-    / "flight_price_catboost_cold_v3.cbm"
+    / "flight_price_catboost_cold_v6.cbm"
 )
 
 WARM_MODEL_PATH = (
     MODEL_DIR
-    / "flight_price_catboost_warm_v3.cbm"
+    / "flight_price_catboost_warm_v6.cbm"
 )
 
 METADATA_PATH = (
     MODEL_DIR
-    / "flight_price_catboost_v3_metadata.joblib"
+    / "flight_price_catboost_v6_metadata.joblib"
 )
-
-
-# ============================================================
-# LOGGING
-# ============================================================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
-
-logger = logging.getLogger(
-    "train-flight-price-model"
-)
-
-
-# ============================================================
-# QUERY
-# ============================================================
-
-QUERY = """
-SELECT
-    g.raw_id,
-
-    g.flight_from,
-    g.flight_to,
-    g.route,
-    g.company,
-
-    g.departure_minutes,
-    g.arrival_minutes,
-
-    g.duration_minutes,
-    g.stops,
-    g.self_transfer,
-    g.connection_count,
-
-    g.days_until_departure,
-
-    g.departure_weekday,
-    g.search_hour,
-
-    g.price_usd,
-
-    s.search_timestamp
-
-FROM gold.flight_price_features g
-
-JOIN silver.flights_scrapy s
-    ON s.raw_id = g.raw_id
-
-ORDER BY s.search_timestamp;
-"""
 
 
 # ============================================================
 # FEATURES
 # ============================================================
 
-CATEGORICAL_FEATURES = [
+TARGET = "price_usd"
+
+
+WARM_CATEGORICAL_FEATURES = [
     "flight_from",
     "flight_to",
     "route",
+    "company",
+]
+
+
+COLD_CATEGORICAL_WITH_ROUTE = [
+    "flight_from",
+    "flight_to",
+    "route",
+    "company",
+]
+
+
+COLD_CATEGORICAL_NO_ROUTE = [
+    "flight_from",
+    "flight_to",
     "company",
 ]
 
@@ -118,17 +112,221 @@ NUMERIC_FEATURES = [
 ]
 
 
-FEATURES = (
-    CATEGORICAL_FEATURES
+WARM_FEATURES = (
+    WARM_CATEGORICAL_FEATURES
     + NUMERIC_FEATURES
 )
 
 
-TARGET = "price_usd"
+COLD_FEATURES_WITH_ROUTE = (
+    COLD_CATEGORICAL_WITH_ROUTE
+    + NUMERIC_FEATURES
+)
+
+
+COLD_FEATURES_NO_ROUTE = (
+    COLD_CATEGORICAL_NO_ROUTE
+    + NUMERIC_FEATURES
+)
 
 
 # ============================================================
-# LOAD DATA
+# MODEL CANDIDATES
+# ============================================================
+
+#
+# A V6 não faz tuning gigantesco.
+#
+# Queremos testar hipóteses claras.
+#
+
+WARM_CANDIDATES = [
+
+    {
+        "name": "warm_depth8_baseline",
+        "params": {
+            "iterations": 2500,
+            "learning_rate": 0.03,
+            "depth": 8,
+            "l2_leaf_reg": 3,
+            "random_strength": 1.0,
+        },
+    },
+
+    {
+        "name": "warm_depth6_l2_10",
+        "params": {
+            "iterations": 3000,
+            "learning_rate": 0.03,
+            "depth": 6,
+            "l2_leaf_reg": 10,
+            "random_strength": 1.0,
+        },
+    },
+
+    {
+        "name": "warm_depth6_l2_20",
+        "params": {
+            "iterations": 3000,
+            "learning_rate": 0.03,
+            "depth": 6,
+            "l2_leaf_reg": 20,
+            "random_strength": 1.0,
+        },
+    },
+
+    {
+        "name": "warm_depth5_l2_15",
+        "params": {
+            "iterations": 3000,
+            "learning_rate": 0.03,
+            "depth": 5,
+            "l2_leaf_reg": 15,
+            "random_strength": 1.0,
+        },
+    },
+
+    {
+        "name": "warm_depth6_slow",
+        "params": {
+            "iterations": 3500,
+            "learning_rate": 0.02,
+            "depth": 6,
+            "l2_leaf_reg": 10,
+            "random_strength": 1.0,
+        },
+    },
+]
+
+
+COLD_CANDIDATES = [
+
+    # --------------------------------------------------------
+    # WITH ROUTE
+    # --------------------------------------------------------
+
+    {
+        "name": "cold_route_depth8",
+        "use_route": True,
+        "params": {
+            "iterations": 2500,
+            "learning_rate": 0.03,
+            "depth": 8,
+            "l2_leaf_reg": 3,
+            "random_strength": 1.0,
+        },
+    },
+
+    {
+        "name": "cold_route_depth6_l2_10",
+        "use_route": True,
+        "params": {
+            "iterations": 3000,
+            "learning_rate": 0.03,
+            "depth": 6,
+            "l2_leaf_reg": 10,
+            "random_strength": 1.0,
+        },
+    },
+
+    {
+        "name": "cold_route_depth5_l2_15",
+        "use_route": True,
+        "params": {
+            "iterations": 3000,
+            "learning_rate": 0.03,
+            "depth": 5,
+            "l2_leaf_reg": 15,
+            "random_strength": 1.0,
+        },
+    },
+
+    # --------------------------------------------------------
+    # WITHOUT ROUTE
+    # --------------------------------------------------------
+
+    {
+        "name": "cold_no_route_depth8",
+        "use_route": False,
+        "params": {
+            "iterations": 2500,
+            "learning_rate": 0.03,
+            "depth": 8,
+            "l2_leaf_reg": 3,
+            "random_strength": 1.0,
+        },
+    },
+
+    {
+        "name": "cold_no_route_depth6_l2_10",
+        "use_route": False,
+        "params": {
+            "iterations": 3000,
+            "learning_rate": 0.03,
+            "depth": 6,
+            "l2_leaf_reg": 10,
+            "random_strength": 1.0,
+        },
+    },
+
+    {
+        "name": "cold_no_route_depth5_l2_15",
+        "use_route": False,
+        "params": {
+            "iterations": 3000,
+            "learning_rate": 0.03,
+            "depth": 5,
+            "l2_leaf_reg": 15,
+            "random_strength": 1.0,
+        },
+    },
+]
+
+
+# ============================================================
+# SQL
+# ============================================================
+
+GOLD_QUERY = """
+SELECT
+    raw_id,
+
+    flight_from,
+    flight_to,
+    route,
+    company,
+
+    departure_minutes,
+    arrival_minutes,
+    duration_minutes,
+
+    stops,
+    self_transfer,
+    connection_count,
+
+    days_until_departure,
+
+    departure_weekday,
+    search_weekday,
+
+    departure_month,
+    search_hour,
+
+    search_timestamp,
+
+    price_usd
+
+FROM gold.flight_price_features
+
+WHERE price_usd IS NOT NULL
+  AND days_until_departure >= 0
+
+ORDER BY search_timestamp;
+"""
+
+
+# ============================================================
+# DATA
 # ============================================================
 
 def load_data():
@@ -142,7 +340,7 @@ def load_data():
     try:
 
         df = pd.read_sql(
-            QUERY,
+            GOLD_QUERY,
             conn
         )
 
@@ -150,23 +348,115 @@ def load_data():
 
         conn.close()
 
-    df["search_timestamp"] = pd.to_datetime(
-        df["search_timestamp"]
+    logger.info(
+        "Registros carregados: %s",
+        len(df)
     )
+
+    # --------------------------------------------------------
+    # Timestamp
+    # --------------------------------------------------------
+
+    df["search_timestamp"] = pd.to_datetime(
+        df["search_timestamp"],
+        errors="coerce"
+    )
+
+    invalid_timestamps = (
+        df["search_timestamp"]
+        .isna()
+        .sum()
+    )
+
+    logger.info(
+        "search_timestamp inválidos: %s",
+        invalid_timestamps
+    )
+
+    # --------------------------------------------------------
+    # Categoricals
+    # --------------------------------------------------------
+
+    all_categorical_columns = [
+        "flight_from",
+        "flight_to",
+        "route",
+        "company",
+    ]
+
+    for column in all_categorical_columns:
+
+        df[column] = (
+            df[column]
+            .fillna("UNKNOWN")
+            .astype(str)
+        )
+
+    # --------------------------------------------------------
+    # Boolean
+    # --------------------------------------------------------
+
+    df["self_transfer"] = (
+        df["self_transfer"]
+        .fillna(False)
+        .astype(int)
+    )
+
+    # --------------------------------------------------------
+    # Required columns
+    # --------------------------------------------------------
+
+    required_columns = list(
+        set(
+            WARM_FEATURES
+            + COLD_FEATURES_WITH_ROUTE
+            + COLD_FEATURES_NO_ROUTE
+            + [
+                TARGET,
+                "search_timestamp",
+            ]
+        )
+    )
+
+    before = len(df)
+
+    df = df.dropna(
+        subset=required_columns
+    ).copy()
+
+    removed = (
+        before
+        - len(df)
+    )
+
+    if removed > 0:
+
+        logger.warning(
+            "Registros removidos por NULL/NaT: %s",
+            removed
+        )
 
     df = (
         df
         .sort_values(
             "search_timestamp"
         )
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
     logger.info(
-        "Registros carregados: %s",
+        "Dataset final: %s registros",
         len(df)
+    )
+
+    logger.info(
+        "Rotas totais: %s",
+        df["route"].nunique()
+    )
+
+    logger.info(
+        "Search timestamps distintos: %s",
+        df["search_timestamp"].nunique()
     )
 
     return df
@@ -178,30 +468,8 @@ def load_data():
 
 def calculate_metrics(
     y_true,
-    y_pred,
-    model_name
+    y_pred
 ):
-
-    if len(y_true) == 0:
-
-        return {
-            "model": model_name,
-            "n": 0,
-            "MAE": None,
-            "RMSE": None,
-            "R2": None,
-            "MAPE": None,
-        }
-
-    y_true = np.asarray(
-        y_true,
-        dtype=float
-    )
-
-    y_pred = np.asarray(
-        y_pred,
-        dtype=float
-    )
 
     mae = mean_absolute_error(
         y_true,
@@ -215,43 +483,37 @@ def calculate_metrics(
         )
     )
 
-    r2 = (
-        r2_score(
-            y_true,
-            y_pred
-        )
-        if len(y_true) >= 2
-        else np.nan
-    )
-
-    nonzero = (
-        y_true != 0
+    r2 = r2_score(
+        y_true,
+        y_pred
     )
 
     mape = (
-        np.mean(
-            np.abs(
-                (
-                    y_true[nonzero]
-                    -
-                    y_pred[nonzero]
-                )
-                /
-                y_true[nonzero]
-            )
-        ) * 100
-        if nonzero.any()
-        else np.nan
+        mean_absolute_percentage_error(
+            y_true,
+            y_pred
+        )
+        * 100
     )
 
-    result = {
-        "model": model_name,
-        "n": len(y_true),
-        "MAE": mae,
-        "RMSE": rmse,
-        "R2": r2,
-        "MAPE": mape,
+    return {
+        "MAE": float(mae),
+        "RMSE": float(rmse),
+        "R2": float(r2),
+        "MAPE": float(mape),
     }
+
+
+def log_metrics(
+    name,
+    y_true,
+    y_pred
+):
+
+    metrics = calculate_metrics(
+        y_true,
+        y_pred
+    )
 
     logger.info(
         "%s | "
@@ -260,35 +522,19 @@ def calculate_metrics(
         "RMSE=%.2f | "
         "R2=%.4f | "
         "MAPE=%.2f%%",
-        model_name,
+        name,
         len(y_true),
-        mae,
-        rmse,
-        r2,
-        mape
+        metrics["MAE"],
+        metrics["RMSE"],
+        metrics["R2"],
+        metrics["MAPE"],
     )
 
-    return result
-
-
-# ============================================================
-# PREPARE FEATURES
-# ============================================================
-
-def prepare_features(df):
-
-    X = df[
-        FEATURES
-    ].copy()
-
-    for col in CATEGORICAL_FEATURES:
-
-        X[col] = (
-            X[col]
-            .astype(str)
-        )
-
-    return X
+    return {
+        "model": name,
+        "n": int(len(y_true)),
+        **metrics,
+    }
 
 
 # ============================================================
@@ -297,332 +543,331 @@ def prepare_features(df):
 
 def global_median_baseline(
     train_df,
-    test_df,
-    name
+    target_df
 ):
 
-    median_price = (
-        train_df[
-            TARGET
-        ]
+    median = (
+        train_df[TARGET]
         .median()
     )
 
-    predictions = np.full(
-        len(test_df),
-        median_price
-    )
-
-    return calculate_metrics(
-        test_df[TARGET],
-        predictions,
-        name
+    return np.full(
+        len(target_df),
+        median
     )
 
 
 def route_median_baseline(
     train_df,
-    test_df,
-    name
+    target_df
 ):
 
     global_median = (
-        train_df[
-            TARGET
-        ]
+        train_df[TARGET]
         .median()
     )
 
     route_medians = (
         train_df
-        .groupby(
-            "route"
-        )[TARGET]
+        .groupby("route")[TARGET]
         .median()
-    )
-
-    predictions = (
-        test_df[
-            "route"
-        ]
-        .map(
-            route_medians
-        )
-        .fillna(
-            global_median
-        )
-        .values
-    )
-
-    return calculate_metrics(
-        test_df[TARGET],
-        predictions,
-        name
-    )
-
-
-# ============================================================
-# TRAIN CATBOOST
-# ============================================================
-
-def train_catboost(
-    train_df,
-    validation_df,
-    model_label
-):
-
-    X_train = prepare_features(
-        train_df
-    )
-
-    y_train = (
-        train_df[
-            TARGET
-        ]
-    )
-
-    X_validation = prepare_features(
-        validation_df
-    )
-
-    y_validation = (
-        validation_df[
-            TARGET
-        ]
-    )
-
-    logger.info(
-        "Treinando %s | "
-        "train=%s | "
-        "validation=%s",
-        model_label,
-        len(train_df),
-        len(validation_df)
-    )
-
-    model = CatBoostRegressor(
-        loss_function="MAE",
-        eval_metric="MAE",
-
-        iterations=2000,
-
-        learning_rate=0.03,
-        depth=8,
-
-        random_seed=42,
-
-        early_stopping_rounds=120,
-
-        verbose=100,
-
-        allow_writing_files=False
-    )
-
-    model.fit(
-        X_train,
-        y_train,
-
-        cat_features=(
-            CATEGORICAL_FEATURES
-        ),
-
-        eval_set=(
-            X_validation,
-            y_validation
-        ),
-
-        use_best_model=True
-    )
-
-    return model
-
-
-# ============================================================
-# EVALUATION
-# ============================================================
-
-def evaluate_model(
-    model,
-    df,
-    name
-):
-
-    if df.empty:
-
-        return calculate_metrics(
-            [],
-            [],
-            name
-        )
-
-    X = prepare_features(
-        df
-    )
-
-    predictions = (
-        model.predict(
-            X
-        )
-    )
-
-    return calculate_metrics(
-        df[TARGET],
-        predictions,
-        name
-    )
-
-
-# ============================================================
-# COLD START SPLIT
-# ============================================================
-
-def build_cold_start_split(df):
-
-    search_date = (
-        df[
-            "search_timestamp"
-        ]
-        .dt.date
-    )
-
-    train_cutoff = (
-        pd.Timestamp(
-            "2026-08-26"
-        )
-        .date()
-    )
-
-    validation_date = (
-        pd.Timestamp(
-            "2026-08-27"
-        )
-        .date()
-    )
-
-    test_date = (
-        pd.Timestamp(
-            "2026-08-28"
-        )
-        .date()
-    )
-
-    train_df = df[
-        search_date
-        <= train_cutoff
-    ].copy()
-
-    validation_df = df[
-        search_date
-        == validation_date
-    ].copy()
-
-    raw_test_df = df[
-        search_date
-        == test_date
-    ].copy()
-
-    train_routes = set(
-        train_df[
-            "route"
-        ].unique()
-    )
-
-    cold_test_df = raw_test_df[
-        ~raw_test_df[
-            "route"
-        ].isin(
-            train_routes
-        )
-    ].copy()
-
-    logger.info("")
-    logger.info(
-        "========== COLD START =========="
-    )
-
-    logger.info(
-        "Cold train: %s",
-        len(train_df)
-    )
-
-    logger.info(
-        "Cold validation: %s",
-        len(validation_df)
-    )
-
-    logger.info(
-        "Cold test: %s",
-        len(cold_test_df)
-    )
-
-    logger.info(
-        "Rotas inéditas cold test: %s",
-        cold_test_df[
-            "route"
-        ].nunique()
+        .to_dict()
     )
 
     return (
-        train_df,
-        validation_df,
-        cold_test_df
+        target_df["route"]
+        .map(route_medians)
+        .fillna(global_median)
+        .values
     )
 
 
 # ============================================================
-# WARM START SPLIT
+# MODEL
 # ============================================================
 
-def build_warm_start_split(
-    df,
-    min_route_samples=10,
-    train_ratio=0.70,
-    validation_ratio=0.15
+def create_model(
+    params
 ):
+
+    return CatBoostRegressor(
+
+        loss_function="MAE",
+
+        eval_metric="MAE",
+
+        random_seed=RANDOM_SEED,
+
+        early_stopping_rounds=150,
+
+        allow_writing_files=False,
+
+        verbose=False,
+
+        **params,
+    )
+
+
+def fit_candidate(
+    train_df,
+    validation_df,
+    features,
+    categorical_features,
+    candidate_name,
+    params
+):
+
+    logger.info(
+        "Treinando candidato: %s",
+        candidate_name
+    )
+
+    model = create_model(
+        params
+    )
+
+    model.fit(
+
+        train_df[features],
+
+        train_df[TARGET],
+
+        cat_features=categorical_features,
+
+        eval_set=(
+            validation_df[features],
+            validation_df[TARGET]
+        ),
+
+        use_best_model=True,
+    )
+
+    train_predictions = model.predict(
+        train_df[features]
+    )
+
+    validation_predictions = model.predict(
+        validation_df[features]
+    )
+
+    train_metrics = calculate_metrics(
+        train_df[TARGET],
+        train_predictions
+    )
+
+    validation_metrics = calculate_metrics(
+        validation_df[TARGET],
+        validation_predictions
+    )
+
+    best_iteration = (
+        model.get_best_iteration()
+    )
+
+    logger.info(
+        (
+            "%s | "
+            "best_iteration=%s | "
+            "train_MAE=%.2f | "
+            "validation_MAE=%.2f | "
+            "gap=%.2f"
+        ),
+        candidate_name,
+        best_iteration,
+        train_metrics["MAE"],
+        validation_metrics["MAE"],
+        (
+            validation_metrics["MAE"]
+            - train_metrics["MAE"]
+        )
+    )
+
+    result = {
+
+        "candidate":
+            candidate_name,
+
+        "best_iteration":
+            int(best_iteration),
+
+        "train_MAE":
+            train_metrics["MAE"],
+
+        "train_RMSE":
+            train_metrics["RMSE"],
+
+        "train_R2":
+            train_metrics["R2"],
+
+        "train_MAPE":
+            train_metrics["MAPE"],
+
+        "validation_MAE":
+            validation_metrics["MAE"],
+
+        "validation_RMSE":
+            validation_metrics["RMSE"],
+
+        "validation_R2":
+            validation_metrics["R2"],
+
+        "validation_MAPE":
+            validation_metrics["MAPE"],
+
+        "generalization_gap_MAE":
+            (
+                validation_metrics["MAE"]
+                - train_metrics["MAE"]
+            ),
+
+        "params":
+            params.copy(),
+    }
+
+    return (
+        model,
+        result,
+    )
+
+
+# ============================================================
+# FEATURE IMPORTANCE
+# ============================================================
+
+def get_feature_importance(
+    model,
+    features
+):
+
+    importance = pd.DataFrame(
+        {
+            "feature":
+                features,
+
+            "importance":
+                model.get_feature_importance(),
+        }
+    )
+
+    return (
+        importance
+        .sort_values(
+            "importance",
+            ascending=False
+        )
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# WARM ROUTE ELIGIBILITY
+# ============================================================
+
+def get_warm_eligible_routes(
+    df
+):
+
+    stats = (
+        df
+        .groupby("route")
+        .agg(
+            samples=(
+                "raw_id",
+                "size"
+            ),
+
+            batches=(
+                "search_timestamp",
+                "nunique"
+            )
+        )
+    )
+
+    eligible = stats[
+        (
+            stats["samples"]
+            >= MIN_WARM_ROUTE_SAMPLES
+        )
+        &
+        (
+            stats["batches"]
+            >= MIN_WARM_ROUTE_BATCHES
+        )
+    ].copy()
+
+    ignored = stats.drop(
+        index=eligible.index
+    )
+
+    return (
+        eligible,
+        ignored
+    )
+
+
+# ============================================================
+# WARM SPLIT
+# ============================================================
+
+def make_warm_route_grouped_split(
+    df
+):
+
+    (
+        eligible_stats,
+        ignored_stats,
+    ) = get_warm_eligible_routes(
+        df
+    )
 
     train_parts = []
     validation_parts = []
     test_parts = []
 
-    eligible_routes = 0
-    ignored_routes = 0
-
-    for route, route_df in (
-        df.groupby(
-            "route"
-        )
+    for route in (
+        eligible_stats
+        .index
+        .tolist()
     ):
 
         route_df = (
-            route_df
+            df[
+                df["route"]
+                == route
+            ]
             .sort_values(
                 "search_timestamp"
             )
-            .reset_index(
-                drop=True
+            .copy()
+        )
+
+        batches = (
+            route_df[
+                "search_timestamp"
+            ]
+            .drop_duplicates()
+            .sort_values()
+            .tolist()
+        )
+
+        n_batches = len(
+            batches
+        )
+
+        train_end = int(
+            np.floor(
+                n_batches
+                * WARM_TRAIN_RATIO
             )
         )
 
-        n = len(
-            route_df
-        )
-
-        if n < min_route_samples:
-
-            ignored_routes += 1
-            continue
-
-        train_end = int(
-            n
-            * train_ratio
-        )
-
-        valid_end = int(
-            n
-            * (
-                train_ratio
-                +
-                validation_ratio
+        validation_end = int(
+            np.floor(
+                n_batches
+                * (
+                    WARM_TRAIN_RATIO
+                    + WARM_VALIDATION_RATIO
+                )
             )
         )
 
@@ -631,44 +876,79 @@ def build_warm_start_split(
             1
         )
 
-        valid_end = max(
-            valid_end,
+        train_end = min(
+            train_end,
+            n_batches - 2
+        )
+
+        validation_end = max(
+            validation_end,
             train_end + 1
         )
 
-        valid_end = min(
-            valid_end,
-            n - 1
+        validation_end = min(
+            validation_end,
+            n_batches - 1
         )
 
-        route_train = (
-            route_df.iloc[
+        train_batches = set(
+            batches[
                 :train_end
             ]
         )
 
-        route_validation = (
-            route_df.iloc[
-                train_end:valid_end
+        validation_batches = set(
+            batches[
+                train_end:
+                validation_end
             ]
         )
 
-        route_test = (
-            route_df.iloc[
-                valid_end:
+        test_batches = set(
+            batches[
+                validation_end:
             ]
         )
 
-        if (
-            route_train.empty
-            or route_validation.empty
-            or route_test.empty
-        ):
+        route_train = route_df[
+            route_df[
+                "search_timestamp"
+            ].isin(
+                train_batches
+            )
+        ].copy()
 
-            ignored_routes += 1
-            continue
+        route_validation = route_df[
+            route_df[
+                "search_timestamp"
+            ].isin(
+                validation_batches
+            )
+        ].copy()
 
-        eligible_routes += 1
+        route_test = route_df[
+            route_df[
+                "search_timestamp"
+            ].isin(
+                test_batches
+            )
+        ].copy()
+
+        assert not route_train.empty
+        assert not route_validation.empty
+        assert not route_test.empty
+
+        assert train_batches.isdisjoint(
+            validation_batches
+        )
+
+        assert train_batches.isdisjoint(
+            test_batches
+        )
+
+        assert validation_batches.isdisjoint(
+            test_batches
+        )
 
         train_parts.append(
             route_train
@@ -680,13 +960,6 @@ def build_warm_start_split(
 
         test_parts.append(
             route_test
-        )
-
-    if not train_parts:
-
-        raise RuntimeError(
-            "Nenhuma rota elegível "
-            "para warm start."
         )
 
     train_df = pd.concat(
@@ -704,41 +977,242 @@ def build_warm_start_split(
         ignore_index=True
     )
 
-    train_df = (
+    # --------------------------------------------------------
+    # Warm route check
+    # --------------------------------------------------------
+
+    train_routes = set(
+        train_df["route"].unique()
+    )
+
+    validation_routes = set(
+        validation_df["route"].unique()
+    )
+
+    test_routes = set(
+        test_df["route"].unique()
+    )
+
+    assert (
+        train_routes
+        == validation_routes
+        == test_routes
+    )
+
+    # --------------------------------------------------------
+    # Leakage check
+    # route + search timestamp
+    # --------------------------------------------------------
+
+    def batch_keys(
+        frame
+    ):
+
+        return set(
+            zip(
+                frame["route"],
+                frame["search_timestamp"]
+            )
+        )
+
+    train_keys = batch_keys(
         train_df
-        .sort_values(
-            "search_timestamp"
-        )
     )
 
-    validation_df = (
+    validation_keys = batch_keys(
         validation_df
-        .sort_values(
-            "search_timestamp"
+    )
+
+    test_keys = batch_keys(
+        test_df
+    )
+
+    assert train_keys.isdisjoint(
+        validation_keys
+    )
+
+    assert train_keys.isdisjoint(
+        test_keys
+    )
+
+    assert validation_keys.isdisjoint(
+        test_keys
+    )
+
+    return {
+        "train":
+            train_df,
+
+        "validation":
+            validation_df,
+
+        "test":
+            test_df,
+
+        "eligible_routes":
+            eligible_stats,
+
+        "ignored_routes":
+            ignored_stats,
+    }
+
+
+# ============================================================
+# COLD ROUTE HOLDOUT
+# ============================================================
+
+def make_cold_route_holdout_split(
+    df
+):
+
+    routes = np.array(
+        sorted(
+            df["route"]
+            .dropna()
+            .unique()
         )
     )
 
-    test_df = (
-        test_df
-        .sort_values(
-            "search_timestamp"
+    rng = np.random.default_rng(
+        RANDOM_SEED
+    )
+
+    rng.shuffle(
+        routes
+    )
+
+    n_routes = len(
+        routes
+    )
+
+    train_end = int(
+        np.floor(
+            n_routes
+            * COLD_TRAIN_ROUTE_RATIO
         )
     )
+
+    validation_end = int(
+        np.floor(
+            n_routes
+            * (
+                COLD_TRAIN_ROUTE_RATIO
+                + COLD_VALIDATION_ROUTE_RATIO
+            )
+        )
+    )
+
+    train_routes = set(
+        routes[
+            :train_end
+        ]
+    )
+
+    validation_routes = set(
+        routes[
+            train_end:
+                validation_end
+        ]
+    )
+
+    test_routes = set(
+        routes[
+            validation_end:
+        ]
+    )
+
+    train_df = df[
+        df["route"].isin(
+            train_routes
+        )
+    ].copy()
+
+    validation_df = df[
+        df["route"].isin(
+            validation_routes
+        )
+    ].copy()
+
+    test_df = df[
+        df["route"].isin(
+            test_routes
+        )
+    ].copy()
+
+    # --------------------------------------------------------
+    # Leakage checks
+    # --------------------------------------------------------
+
+    assert train_routes.isdisjoint(
+        validation_routes
+    )
+
+    assert train_routes.isdisjoint(
+        test_routes
+    )
+
+    assert validation_routes.isdisjoint(
+        test_routes
+    )
+
+    return {
+        "train":
+            train_df,
+
+        "validation":
+            validation_df,
+
+        "test":
+            test_df,
+
+        "train_routes":
+            sorted(
+                train_routes
+            ),
+
+        "validation_routes":
+            sorted(
+                validation_routes
+            ),
+
+        "test_routes":
+            sorted(
+                test_routes
+            ),
+    }
+
+
+# ============================================================
+# WARM MODEL SELECTION
+# ============================================================
+
+def run_warm_experiment(
+    df
+):
 
     logger.info("")
-    logger.info(
-        "========== WARM START =========="
-    )
 
     logger.info(
-        "Rotas elegíveis: %s",
-        eligible_routes
+        "========== WARM V6 =========="
     )
 
-    logger.info(
-        "Rotas ignoradas: %s",
-        ignored_routes
+    split = (
+        make_warm_route_grouped_split(
+            df
+        )
     )
+
+    train_df = split[
+        "train"
+    ]
+
+    validation_df = split[
+        "validation"
+    ]
+
+    test_df = split[
+        "test"
+    ]
 
     logger.info(
         "Warm train: %s",
@@ -756,204 +1230,243 @@ def build_warm_start_split(
     )
 
     logger.info(
-        "Rotas no warm train: %s",
+        "Warm routes: %s",
         train_df[
             "route"
         ].nunique()
     )
 
     logger.info(
-        "Rotas no warm test: %s",
-        test_df[
-            "route"
-        ].nunique()
+        "Warm leakage sanity check: OK"
     )
 
-    train_routes = set(
-        train_df[
-            "route"
-        ].unique()
+    # --------------------------------------------------------
+    # Baselines on TEST
+    #
+    # Não são usados para model selection.
+    # --------------------------------------------------------
+
+    global_test_predictions = (
+        global_median_baseline(
+            train_df,
+            test_df
+        )
     )
 
-    test_routes = set(
-        test_df[
-            "route"
-        ].unique()
+    route_test_predictions = (
+        route_median_baseline(
+            train_df,
+            test_df
+        )
     )
 
-    missing_routes = (
-        test_routes
-        -
-        train_routes
+    baseline_global_metrics = (
+        log_metrics(
+            "Warm V6 - Global Median",
+            test_df[TARGET],
+            global_test_predictions
+        )
     )
 
-    if missing_routes:
+    baseline_route_metrics = (
+        log_metrics(
+            "Warm V6 - Route Median",
+            test_df[TARGET],
+            route_test_predictions
+        )
+    )
 
-        raise RuntimeError(
-            "Warm split inválido. "
-            f"Rotas inéditas: {missing_routes}"
+    # --------------------------------------------------------
+    # Candidate selection using VALIDATION ONLY
+    # --------------------------------------------------------
+
+    candidate_models = {}
+
+    candidate_results = []
+
+    for candidate in WARM_CANDIDATES:
+
+        model, result = fit_candidate(
+
+            train_df=
+                train_df,
+
+            validation_df=
+                validation_df,
+
+            features=
+                WARM_FEATURES,
+
+            categorical_features=
+                WARM_CATEGORICAL_FEATURES,
+
+            candidate_name=
+                candidate["name"],
+
+            params=
+                candidate["params"],
         )
 
-    return (
-        train_df,
-        validation_df,
-        test_df
+        candidate_models[
+            candidate["name"]
+        ] = model
+
+        candidate_results.append(
+            result
+        )
+
+    candidate_results_df = pd.DataFrame(
+        candidate_results
     )
 
-
-# ============================================================
-# FEATURE IMPORTANCE
-# ============================================================
-
-def get_feature_importance(
-    model,
-    label
-):
-
-    importance_df = pd.DataFrame({
-        "feature":
-            FEATURES,
-
-        "importance":
-            model.get_feature_importance()
-    })
-
-    importance_df = (
-        importance_df
+    candidate_results_df = (
+        candidate_results_df
         .sort_values(
-            "importance",
-            ascending=False
+            "validation_MAE"
         )
-        .reset_index(
-            drop=True
-        )
+        .reset_index(drop=True)
     )
 
     logger.info(
-        "\nFeature Importance - %s:\n%s",
-        label,
-        importance_df.to_string(
+        "\nWarm candidate comparison:\n%s",
+        candidate_results_df[
+            [
+                "candidate",
+                "best_iteration",
+                "train_MAE",
+                "validation_MAE",
+                "generalization_gap_MAE",
+                "validation_R2",
+                "validation_MAPE",
+            ]
+        ].to_string(
             index=False
         )
     )
 
-    return importance_df
+    # --------------------------------------------------------
+    # WINNER
+    # --------------------------------------------------------
 
-
-# ============================================================
-# COLD BENCHMARK
-# ============================================================
-
-def run_cold_start(df):
-
-    (
-        train_df,
-        validation_df,
-        test_df
-    ) = build_cold_start_split(
-        df
+    winner_name = (
+        candidate_results_df
+        .iloc[0]["candidate"]
     )
 
-    metrics = []
+    winner_model = (
+        candidate_models[
+            winner_name
+        ]
+    )
 
-    metrics.append(
-        global_median_baseline(
-            train_df,
-            test_df,
-            "Cold - Global Median"
+    winner_config = next(
+        x
+        for x in WARM_CANDIDATES
+        if x["name"] == winner_name
+    )
+
+    logger.info(
+        "Warm winner por validation MAE: %s",
+        winner_name
+    )
+
+    # --------------------------------------------------------
+    # TEST ONCE
+    # --------------------------------------------------------
+
+    test_predictions = (
+        winner_model.predict(
+            test_df[
+                WARM_FEATURES
+            ]
         )
     )
 
-    metrics.append(
-        route_median_baseline(
-            train_df,
-            test_df,
-            "Cold - Route Median"
+    test_metrics = (
+        log_metrics(
+            (
+                "Warm V6 - "
+                f"{winner_name}"
+            ),
+            test_df[TARGET],
+            test_predictions,
         )
     )
 
-    model = train_catboost(
-        train_df,
-        validation_df,
-        "Cold Start"
-    )
+    # --------------------------------------------------------
+    # IMPORTANCE
+    # --------------------------------------------------------
 
-    metrics.append(
-        evaluate_model(
-            model,
-            test_df,
-            "Cold - CatBoost"
-        )
-    )
-
-    importance_df = (
+    importance = (
         get_feature_importance(
-            model,
-            "Cold Start"
+            winner_model,
+            WARM_FEATURES
         )
     )
 
-    return (
-        model,
-        metrics,
-        importance_df
-    )
-
-
-# ============================================================
-# WARM BENCHMARK
-# ============================================================
-
-def run_warm_start(df):
-
-    (
-        train_df,
-        validation_df,
-        test_df
-    ) = build_warm_start_split(
-        df
-    )
-
-    metrics = []
-
-    metrics.append(
-        global_median_baseline(
-            train_df,
-            test_df,
-            "Warm - Global Median"
+    logger.info(
+        "\nFeature Importance "
+        "- Warm V6 winner:\n%s",
+        importance.to_string(
+            index=False
         )
     )
 
-    metrics.append(
-        route_median_baseline(
-            train_df,
-            test_df,
-            "Warm - Route Median"
-        )
-    )
+    info = {
 
-    model = train_catboost(
-        train_df,
-        validation_df,
-        "Warm Start"
-    )
+        "winner":
+            winner_name,
 
-    metrics.append(
-        evaluate_model(
-            model,
-            test_df,
-            "Warm - CatBoost"
-        )
-    )
+        "winner_params":
+            winner_config[
+                "params"
+            ],
 
-    importance_df = (
-        get_feature_importance(
-            model,
-            "Warm Start"
-        )
-    )
+        "train_rows":
+            len(train_df),
 
-    warm_known_routes = sorted(
+        "validation_rows":
+            len(validation_df),
+
+        "test_rows":
+            len(test_df),
+
+        "routes":
+            train_df[
+                "route"
+            ].nunique(),
+
+        "eligible_routes":
+            len(
+                split[
+                    "eligible_routes"
+                ]
+            ),
+
+        "ignored_routes":
+            len(
+                split[
+                    "ignored_routes"
+                ]
+            ),
+
+        "candidate_results":
+            candidate_results_df
+            .to_dict(
+                orient="records"
+            ),
+
+        "baseline_global":
+            baseline_global_metrics,
+
+        "baseline_route":
+            baseline_route_metrics,
+
+        "test_metrics":
+            test_metrics,
+    }
+
+    known_routes = sorted(
         train_df[
             "route"
         ]
@@ -962,24 +1475,395 @@ def run_warm_start(df):
     )
 
     return (
-        model,
-        metrics,
-        importance_df,
-        warm_known_routes
+        winner_model,
+        importance,
+        known_routes,
+        info,
+        test_metrics,
     )
 
 
 # ============================================================
-# SAVE MODELS
+# COLD MODEL SELECTION
 # ============================================================
 
-def save_models(
+def run_cold_experiment(
+    df
+):
+
+    logger.info("")
+
+    logger.info(
+        "========== COLD V6 =========="
+    )
+
+    split = (
+        make_cold_route_holdout_split(
+            df
+        )
+    )
+
+    train_df = split[
+        "train"
+    ]
+
+    validation_df = split[
+        "validation"
+    ]
+
+    test_df = split[
+        "test"
+    ]
+
+    logger.info(
+        "Cold train: %s",
+        len(train_df)
+    )
+
+    logger.info(
+        "Cold validation: %s",
+        len(validation_df)
+    )
+
+    logger.info(
+        "Cold test: %s",
+        len(test_df)
+    )
+
+    logger.info(
+        "Cold routes train/validation/test: "
+        "%s/%s/%s",
+        len(
+            split[
+                "train_routes"
+            ]
+        ),
+        len(
+            split[
+                "validation_routes"
+            ]
+        ),
+        len(
+            split[
+                "test_routes"
+            ]
+        ),
+    )
+
+    logger.info(
+        "Cold route leakage sanity check: OK"
+    )
+
+    # --------------------------------------------------------
+    # BASELINE
+    # --------------------------------------------------------
+
+    global_test_predictions = (
+        global_median_baseline(
+            train_df,
+            test_df
+        )
+    )
+
+    baseline_global_metrics = (
+        log_metrics(
+            "Cold V6 - Global Median",
+            test_df[TARGET],
+            global_test_predictions
+        )
+    )
+
+    # --------------------------------------------------------
+    # Candidate selection using VALIDATION ONLY
+    # --------------------------------------------------------
+
+    candidate_models = {}
+
+    candidate_results = []
+
+    for candidate in COLD_CANDIDATES:
+
+        use_route = (
+            candidate[
+                "use_route"
+            ]
+        )
+
+        if use_route:
+
+            features = (
+                COLD_FEATURES_WITH_ROUTE
+            )
+
+            categorical_features = (
+                COLD_CATEGORICAL_WITH_ROUTE
+            )
+
+        else:
+
+            features = (
+                COLD_FEATURES_NO_ROUTE
+            )
+
+            categorical_features = (
+                COLD_CATEGORICAL_NO_ROUTE
+            )
+
+        model, result = fit_candidate(
+
+            train_df=
+                train_df,
+
+            validation_df=
+                validation_df,
+
+            features=
+                features,
+
+            categorical_features=
+                categorical_features,
+
+            candidate_name=
+                candidate["name"],
+
+            params=
+                candidate["params"],
+        )
+
+        result[
+            "use_route"
+        ] = use_route
+
+        candidate_models[
+            candidate["name"]
+        ] = {
+            "model":
+                model,
+
+            "features":
+                features,
+
+            "categorical_features":
+                categorical_features,
+        }
+
+        candidate_results.append(
+            result
+        )
+
+    candidate_results_df = pd.DataFrame(
+        candidate_results
+    )
+
+    candidate_results_df = (
+        candidate_results_df
+        .sort_values(
+            "validation_MAE"
+        )
+        .reset_index(drop=True)
+    )
+
+    logger.info(
+        "\nCold candidate comparison:\n%s",
+        candidate_results_df[
+            [
+                "candidate",
+                "use_route",
+                "best_iteration",
+                "train_MAE",
+                "validation_MAE",
+                "generalization_gap_MAE",
+                "validation_R2",
+                "validation_MAPE",
+            ]
+        ].to_string(
+            index=False
+        )
+    )
+
+    # --------------------------------------------------------
+    # WINNER
+    # --------------------------------------------------------
+
+    winner_name = (
+        candidate_results_df
+        .iloc[0]["candidate"]
+    )
+
+    winner_data = (
+        candidate_models[
+            winner_name
+        ]
+    )
+
+    winner_model = (
+        winner_data[
+            "model"
+        ]
+    )
+
+    winner_features = (
+        winner_data[
+            "features"
+        ]
+    )
+
+    winner_categorical = (
+        winner_data[
+            "categorical_features"
+        ]
+    )
+
+    winner_config = next(
+        x
+        for x in COLD_CANDIDATES
+        if x["name"] == winner_name
+    )
+
+    logger.info(
+        "Cold winner por validation MAE: %s",
+        winner_name
+    )
+
+    logger.info(
+        "Cold winner usa route: %s",
+        winner_config[
+            "use_route"
+        ]
+    )
+
+    # --------------------------------------------------------
+    # TEST ONCE
+    # --------------------------------------------------------
+
+    test_predictions = (
+        winner_model.predict(
+            test_df[
+                winner_features
+            ]
+        )
+    )
+
+    test_metrics = (
+        log_metrics(
+            (
+                "Cold V6 - "
+                f"{winner_name}"
+            ),
+            test_df[TARGET],
+            test_predictions,
+        )
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANCE
+    # --------------------------------------------------------
+
+    importance = (
+        get_feature_importance(
+            winner_model,
+            winner_features
+        )
+    )
+
+    logger.info(
+        "\nFeature Importance "
+        "- Cold V6 winner:\n%s",
+        importance.to_string(
+            index=False
+        )
+    )
+
+    info = {
+
+        "winner":
+            winner_name,
+
+        "winner_params":
+            winner_config[
+                "params"
+            ],
+
+        "winner_use_route":
+            winner_config[
+                "use_route"
+            ],
+
+        "winner_features":
+            winner_features,
+
+        "winner_categorical_features":
+            winner_categorical,
+
+        "train_rows":
+            len(train_df),
+
+        "validation_rows":
+            len(validation_df),
+
+        "test_rows":
+            len(test_df),
+
+        "train_routes":
+            len(
+                split[
+                    "train_routes"
+                ]
+            ),
+
+        "validation_routes":
+            len(
+                split[
+                    "validation_routes"
+                ]
+            ),
+
+        "test_routes":
+            len(
+                split[
+                    "test_routes"
+                ]
+            ),
+
+        "candidate_results":
+            candidate_results_df
+            .to_dict(
+                orient="records"
+            ),
+
+        "baseline_global":
+            baseline_global_metrics,
+
+        "test_metrics":
+            test_metrics,
+    }
+
+    return (
+        winner_model,
+        importance,
+        info,
+        test_metrics,
+        winner_features,
+        winner_categorical,
+    )
+
+
+# ============================================================
+# SAVE
+# ============================================================
+
+def save_artifacts(
     cold_model,
     warm_model,
-    metrics_df,
-    cold_importance,
     warm_importance,
-    warm_known_routes
+    cold_importance,
+    warm_known_routes,
+    warm_info,
+    cold_info,
+    warm_test_metrics,
+    cold_test_metrics,
+    cold_features,
+    cold_categorical_features,
 ):
 
     MODEL_DIR.mkdir(
@@ -1002,37 +1886,71 @@ def save_models(
     metadata = {
 
         "version":
-            "v3",
+            "v6",
+
+        "selection_rule":
+            (
+                "candidate selection performed "
+                "using validation MAE only; "
+                "test evaluated after winner selection"
+            ),
 
         "target":
             TARGET,
 
-        "features":
-            FEATURES,
+        # ----------------------------------------------------
+        # WARM
+        # ----------------------------------------------------
 
-        "categorical_features":
-            CATEGORICAL_FEATURES,
+        "warm_features":
+            WARM_FEATURES,
 
-        "numeric_features":
-            NUMERIC_FEATURES,
+        "warm_categorical_features":
+            WARM_CATEGORICAL_FEATURES,
 
         "warm_known_routes":
             warm_known_routes,
 
-        "metrics":
-            metrics_df.to_dict(
-                orient="records"
-            ),
-
-        "cold_feature_importance":
-            cold_importance.to_dict(
-                orient="records"
-            ),
+        "warm_experiment":
+            warm_info,
 
         "warm_feature_importance":
-            warm_importance.to_dict(
+            warm_importance
+            .to_dict(
                 orient="records"
             ),
+
+        "warm_test_metrics":
+            warm_test_metrics,
+
+        # ----------------------------------------------------
+        # COLD
+        # ----------------------------------------------------
+
+        "cold_features":
+            cold_features,
+
+        "cold_categorical_features":
+            cold_categorical_features,
+
+        "cold_experiment":
+            cold_info,
+
+        "cold_feature_importance":
+            cold_importance
+            .to_dict(
+                orient="records"
+            ),
+
+        "cold_test_metrics":
+            cold_test_metrics,
+
+        # ----------------------------------------------------
+        # Shared numeric features
+        # ----------------------------------------------------
+
+        "numeric_features":
+            NUMERIC_FEATURES,
     }
 
     joblib.dump(
@@ -1057,57 +1975,182 @@ def save_models(
 
 
 # ============================================================
+# FINAL SUMMARY
+# ============================================================
+
+def log_final_summary(
+    warm_info,
+    cold_info,
+    warm_test_metrics,
+    cold_test_metrics,
+):
+
+    logger.info("")
+
+    logger.info(
+        "========== FINAL V6 =========="
+    )
+
+    logger.info(
+        (
+            "WARM WINNER | "
+            "%s | "
+            "TEST MAE=%.2f | "
+            "RMSE=%.2f | "
+            "R2=%.4f | "
+            "MAPE=%.2f%%"
+        ),
+        warm_info[
+            "winner"
+        ],
+        warm_test_metrics[
+            "MAE"
+        ],
+        warm_test_metrics[
+            "RMSE"
+        ],
+        warm_test_metrics[
+            "R2"
+        ],
+        warm_test_metrics[
+            "MAPE"
+        ],
+    )
+
+    logger.info(
+        (
+            "COLD WINNER | "
+            "%s | "
+            "use_route=%s | "
+            "TEST MAE=%.2f | "
+            "RMSE=%.2f | "
+            "R2=%.4f | "
+            "MAPE=%.2f%%"
+        ),
+        cold_info[
+            "winner"
+        ],
+        cold_info[
+            "winner_use_route"
+        ],
+        cold_test_metrics[
+            "MAE"
+        ],
+        cold_test_metrics[
+            "RMSE"
+        ],
+        cold_test_metrics[
+            "R2"
+        ],
+        cold_test_metrics[
+            "MAPE"
+        ],
+    )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
 def main():
 
+    # --------------------------------------------------------
+    # DATA
+    # --------------------------------------------------------
+
     df = load_data()
 
-    (
-        cold_model,
-        cold_metrics,
-        cold_importance
-    ) = run_cold_start(
-        df
-    )
+    # --------------------------------------------------------
+    # WARM
+    # --------------------------------------------------------
 
     (
         warm_model,
-        warm_metrics,
         warm_importance,
-        warm_known_routes
-    ) = run_warm_start(
+        warm_known_routes,
+        warm_info,
+        warm_test_metrics,
+    ) = run_warm_experiment(
         df
     )
 
-    all_metrics = (
-        cold_metrics
-        +
-        warm_metrics
-    )
+    # --------------------------------------------------------
+    # COLD
+    # --------------------------------------------------------
 
-    metrics_df = pd.DataFrame(
-        all_metrics
-    )
-
-    logger.info(
-        "\n"
-        "========== FINAL COMPARISON ==========\n%s",
-        metrics_df.to_string(
-            index=False
-        )
-    )
-
-    save_models(
+    (
         cold_model,
-        warm_model,
-        metrics_df,
         cold_importance,
-        warm_importance,
-        warm_known_routes
+        cold_info,
+        cold_test_metrics,
+        cold_features,
+        cold_categorical_features,
+    ) = run_cold_experiment(
+        df
     )
 
+    # --------------------------------------------------------
+    # SUMMARY
+    # --------------------------------------------------------
+
+    log_final_summary(
+        warm_info=
+            warm_info,
+
+        cold_info=
+            cold_info,
+
+        warm_test_metrics=
+            warm_test_metrics,
+
+        cold_test_metrics=
+            cold_test_metrics,
+    )
+
+    # --------------------------------------------------------
+    # SAVE
+    # --------------------------------------------------------
+
+    save_artifacts(
+
+        cold_model=
+            cold_model,
+
+        warm_model=
+            warm_model,
+
+        warm_importance=
+            warm_importance,
+
+        cold_importance=
+            cold_importance,
+
+        warm_known_routes=
+            warm_known_routes,
+
+        warm_info=
+            warm_info,
+
+        cold_info=
+            cold_info,
+
+        warm_test_metrics=
+            warm_test_metrics,
+
+        cold_test_metrics=
+            cold_test_metrics,
+
+        cold_features=
+            cold_features,
+
+        cold_categorical_features=
+            cold_categorical_features,
+    )
+
+
+# ============================================================
+# ENTRYPOINT
+# ============================================================
 
 if __name__ == "__main__":
     main()
