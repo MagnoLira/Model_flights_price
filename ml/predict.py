@@ -103,15 +103,31 @@ def load_artifacts():
 ) = load_artifacts()
 
 
-FEATURES = (
+# ============================================================
+# FEATURES POR MODELO
+# ============================================================
+
+WARM_FEATURES = (
     METADATA[
-        "features"
+        "warm_features"
     ]
 )
 
-CATEGORICAL_FEATURES = (
+WARM_CATEGORICAL_FEATURES = (
     METADATA[
-        "categorical_features"
+        "warm_categorical_features"
+    ]
+)
+
+COLD_FEATURES = (
+    METADATA[
+        "cold_features"
+    ]
+)
+
+COLD_CATEGORICAL_FEATURES = (
+    METADATA[
+        "cold_categorical_features"
     ]
 )
 
@@ -127,7 +143,9 @@ WARM_KNOWN_ROUTES = set(
 # HELPERS
 # ============================================================
 
-def parse_time_to_minutes(value):
+def parse_time_to_minutes(
+    value
+):
 
     if value is None:
 
@@ -179,7 +197,9 @@ def parse_time_to_minutes(value):
     )
 
 
-def parse_date(value):
+def parse_date(
+    value
+):
 
     if isinstance(
         value,
@@ -188,26 +208,36 @@ def parse_date(value):
 
         return value.date()
 
-    if hasattr(
-        value,
-        "year"
-    ) and hasattr(
-        value,
-        "month"
-    ) and hasattr(
-        value,
-        "day"
+    if (
+        hasattr(
+            value,
+            "year"
+        )
+        and
+        hasattr(
+            value,
+            "month"
+        )
+        and
+        hasattr(
+            value,
+            "day"
+        )
     ):
 
         return value
 
     return datetime.strptime(
-        str(value),
+        str(
+            value
+        ),
         "%Y-%m-%d"
     ).date()
 
 
-def parse_datetime(value):
+def parse_datetime(
+    value
+):
 
     if isinstance(
         value,
@@ -218,11 +248,13 @@ def parse_datetime(value):
 
     value = str(
         value
-    )
+    ).strip()
 
     formats = (
         "%Y-%m-%d %H:%M:%S",
         "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S.%f",
     )
 
     for fmt in formats:
@@ -255,22 +287,24 @@ def build_features(
         flight[
             "flight_from"
         ]
-    ).upper()
+    ).upper().strip()
 
     flight_to = str(
         flight[
             "flight_to"
         ]
-    ).upper()
+    ).upper().strip()
 
     route = (
         f"{flight_from}_{flight_to}"
     )
 
-    ticket_date = parse_date(
-        flight[
-            "ticket_date"
-        ]
+    ticket_date = (
+        parse_date(
+            flight[
+                "ticket_date"
+            ]
+        )
     )
 
     search_timestamp = (
@@ -346,7 +380,7 @@ def build_features(
                 flight[
                     "company"
                 ]
-            ),
+            ).strip(),
 
         "departure_minutes":
             departure_minutes,
@@ -399,32 +433,46 @@ def get_expected_mae(
     model_type
 ):
 
-    metrics = (
-        METADATA.get(
-            "metrics",
-            []
+    if model_type == "warm":
+
+        metrics = (
+            METADATA.get(
+                "warm_test_metrics",
+                {}
+            )
+        )
+
+    else:
+
+        metrics = (
+            METADATA.get(
+                "cold_test_metrics",
+                {}
+            )
+        )
+
+    if not isinstance(
+        metrics,
+        dict
+    ):
+
+        return None
+
+    mae = (
+        metrics.get(
+            "MAE"
         )
     )
 
-    target_model_name = (
-        "Warm - CatBoost"
-        if model_type == "warm"
-        else "Cold - CatBoost"
-    )
+    if mae is None:
 
-    for item in metrics:
-
-        if (
-            item.get("model")
-            ==
-            target_model_name
-        ):
-
-            return item.get(
-                "MAE"
+        mae = (
+            metrics.get(
+                "mae"
             )
+        )
 
-    return None
+    return mae
 
 
 # ============================================================
@@ -435,8 +483,10 @@ def predict_flight(
     flight
 ):
 
-    features = build_features(
-        flight
+    features = (
+        build_features(
+            flight
+        )
     )
 
     route = (
@@ -451,6 +501,10 @@ def predict_flight(
         WARM_KNOWN_ROUTES
     )
 
+    # ========================================================
+    # ESCOLHA DO MODELO
+    # ========================================================
+
     if route_known:
 
         model = (
@@ -459,6 +513,14 @@ def predict_flight(
 
         model_type = (
             "warm"
+        )
+
+        model_features = (
+            WARM_FEATURES
+        )
+
+        categorical_features = (
+            WARM_CATEGORICAL_FEATURES
         )
 
     else:
@@ -471,22 +533,44 @@ def predict_flight(
             "cold"
         )
 
+        model_features = (
+            COLD_FEATURES
+        )
+
+        categorical_features = (
+            COLD_CATEGORICAL_FEATURES
+        )
+
+    # ========================================================
+    # DATAFRAME
+    # ========================================================
+
     X = pd.DataFrame(
         [
             features
         ]
     )
 
+    # Usa exatamente as features esperadas
+    # pelo modelo selecionado.
     X = X[
-        FEATURES
-    ]
+        model_features
+    ].copy()
 
-    for col in CATEGORICAL_FEATURES:
+    # ========================================================
+    # CATEGÓRICAS
+    # ========================================================
+
+    for col in categorical_features:
 
         X[col] = (
             X[col]
             .astype(str)
         )
+
+    # ========================================================
+    # PREDIÇÃO
+    # ========================================================
 
     prediction = float(
         model.predict(
@@ -499,6 +583,10 @@ def predict_flight(
             model_type
         )
     )
+
+    # ========================================================
+    # RESULTADO
+    # ========================================================
 
     result = {
 
@@ -536,55 +624,3 @@ def predict_flight(
 
     return result
 
-
-# ============================================================
-# MANUAL TEST
-# ============================================================
-
-if __name__ == "__main__":
-
-    example = {
-
-        "flight_from":
-            "BSB",
-
-        "flight_to":
-            "JTC",
-
-        "company":
-            "Azul Linhas Aereas",
-
-        "departure_time":
-            "05:25",
-
-        "arrival_time":
-            "10:25",
-
-        "duration_minutes":
-            300,
-
-        "stops":
-            1,
-
-        "self_transfer":
-            False,
-
-        "connection_airports":
-            [
-                "VCP"
-            ],
-
-        "ticket_date":
-            "2026-09-20",
-
-        "search_timestamp":
-            "2026-09-15 18:30:00",
-    }
-
-    result = predict_flight(
-        example
-    )
-
-    print(
-        result
-    )
