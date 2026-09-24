@@ -3,3 +3,4 @@
 .cbm
 .joblib
 .envflight-price-api-v1.tar
+*.tar
