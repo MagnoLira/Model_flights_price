@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
         - name: flight-price-api
-          image: docker.io/library/flight-price-api:v1
+          image: docker.io/library/flight-price-api:v6
           imagePullPolicy: Never
 
           ports:
