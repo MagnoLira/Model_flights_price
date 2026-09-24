@@ -20,17 +20,17 @@ MODEL_DIR = (
 
 COLD_MODEL_PATH = (
     MODEL_DIR
-    / "flight_price_catboost_cold_v3.cbm"
+    / "flight_price_catboost_cold_v6.cbm"
 )
 
 WARM_MODEL_PATH = (
     MODEL_DIR
-    / "flight_price_catboost_warm_v3.cbm"
+    / "flight_price_catboost_warm_v6.cbm"
 )
 
 METADATA_PATH = (
     MODEL_DIR
-    / "flight_price_catboost_v3_metadata.joblib"
+    / "flight_price_catboost_v6_metadata.joblib"
 )
 
 
