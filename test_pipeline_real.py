@@ -21,8 +21,8 @@ load_dotenv()  # Load environment variables from .env file
 # CONFIGURAÇÃO
 # ============================================================
 
-ORIGEM = "THE"
-DESTINO = "CGH"
+ORIGEM = "BSB"
+DESTINO = "CNF"
 
 DIAS_A_FRENTE = 3
 
