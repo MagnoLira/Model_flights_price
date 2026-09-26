@@ -336,6 +336,15 @@ Target:
 price_usd
 ```
 
+Additional temporal variables may also be materialized in GOLD:
+
+```text
+search_weekday
+departure_month
+```
+
+These variables are currently not part of the deployed V6 feature set.
+
 Example:
 
 ```text
@@ -363,7 +372,11 @@ Flight characteristics
         +
 Search context
         ↓
-      CatBoost
+Feature Engineering
+        ↓
+Warm / Cold Routing
+        ↓
+CatBoost
         ↓
 Expected flight price
 ```
@@ -392,12 +405,36 @@ Model expected price
 Example:
 
 ```text
-Observed price:       USD 356.00
-Model expected price: USD 382.74
-Deviation:            USD -26.74
+Observed price:       USD 232.00
+Model expected price: USD 312.99
+Residual:             USD -80.99
 ```
 
-This deviation can later be used by a decision layer to determine whether a ticket appears below, around, or above the expected market price.
+The residual is calculated as:
+
+```text
+observed price - predicted price
+```
+
+Therefore:
+
+```text
+negative residual
+      ↓
+observed price below expected price
+```
+
+and:
+
+```text
+positive residual
+      ↓
+observed price above expected price
+```
+
+This comparison does not imply that a price will increase or decrease in the future.
+
+It only compares the current observed value with the reference price learned by the model from historical observations with similar characteristics.
 
 ---
 
@@ -413,59 +450,50 @@ It can naturally model relationships involving:
 - booking lead time;
 - duration;
 - number of stops;
-- departure time.
+- departure time;
+- search hour.
 
 It also avoids the need for large one-hot encoded feature matrices.
+
+The problem contains potentially high-cardinality categorical variables such as airport pairs and routes, making CatBoost particularly convenient for the current architecture.
 
 ---
 
 ## Warm Start and Cold Start
 
-The system currently maintains two CatBoost models.
-
-### Warm Start Model
-
-The warm model is used when the route had sufficient historical representation during training.
-
-During the current training procedure, routes require at least 10 observations to become eligible for the warm-start dataset.
-
-At training time:
+The production system maintains two CatBoost regression models.
 
 ```text
-Eligible warm routes: 367
-Ignored routes:       92
+Incoming flight
+      ↓
+Is route in warm_known_routes?
+      ↓
+ ┌────┴────┐
+yes       no
+ ↓         ↓
+Warm      Cold
+Model     Model
 ```
 
-The set of known routes is stored inside the model metadata:
+The two models represent different generalization scenarios.
 
-```text
-warm_known_routes
-```
+### Warm Start
 
-This list is frozen together with the trained model artifacts.
+Warm-start inference is used when the requested route belongs to the route universe known by the warm model during training.
 
-Current warm benchmark:
+The purpose of this evaluation is to answer:
 
-```text
-MAE   = 78.09 USD
-RMSE  = 123.78 USD
-R²    = 0.7333
-MAPE  = 17.10%
-```
+> How accurately can the model estimate new observations from routes that were already represented historically?
 
-Route-median baseline:
+### Cold Start
 
-```text
-MAE = 103.85 USD
-```
+Cold-start inference is used when the exact route was not part of the warm model's known-route universe.
 
-The CatBoost model therefore improves over a simple historical route median in the current evaluation.
+The purpose is to answer:
 
-### Cold Start Model
+> Can the model generalize to an origin-destination pair that was not represented in the cold training route set?
 
-The cold model is used when the exact route is not part of the warm model's known-route set.
-
-The objective is to estimate prices using patterns learned from variables such as:
+The cold model must rely more heavily on patterns involving:
 
 ```text
 origin
@@ -475,24 +503,223 @@ duration
 stops
 booking lead time
 departure time
+search context
 ```
 
-even when the exact origin-destination pair was not sufficiently represented during training.
+rather than depending exclusively on memorizing historical prices for a specific route.
 
-Current cold benchmark:
+---
+
+## Warm-Start Training Strategy
+
+The warm model evaluates generalization to new observations of historically represented routes.
+
+Routes with sufficient representation are selected for the warm training universe.
+
+The current V6 warm split contains:
 
 ```text
-MAE   = 109.37 USD
-RMSE  = 141.01 USD
-R²    = 0.4763
-MAPE  = 23.74%
+Training:   10,831 observations
+Validation:  3,009 observations
+Test:        4,349 observations
 ```
 
-Global-median baseline:
+The trained warm model contains:
 
 ```text
-MAE = 160.69 USD
+577 known routes
 ```
+
+These routes are stored in:
+
+```text
+warm_known_routes
+```
+
+inside the model metadata.
+
+Multiple CatBoost configurations were trained and evaluated.
+
+Candidate configurations included:
+
+```text
+warm_depth8_baseline
+warm_depth6_l2_10
+warm_depth6_l2_20
+warm_depth6_slow
+warm_depth5_l2_15
+```
+
+Model selection is performed using validation MAE.
+
+The selected V6 warm model was:
+
+```text
+warm_depth8_baseline
+```
+
+Validation results:
+
+```text
+Validation MAE   = 61.25 USD
+Validation R²    = 0.8133
+Validation MAPE  = 18.74%
+Training MAE     = 28.60 USD
+```
+
+Final held-out test results:
+
+```text
+MAE   = 65.96 USD
+RMSE  = 104.93 USD
+R²    = 0.8018
+MAPE  = 25.76%
+```
+
+The difference between training and validation error indicates some generalization gap.
+
+However, model selection is performed on the validation partition and the final performance is measured separately on the held-out test partition.
+
+---
+
+## Cold-Start Training Strategy
+
+The cold-start experiment uses a different splitting strategy.
+
+Instead of merely separating individual observations, entire routes are held out.
+
+Conceptually:
+
+```text
+Training routes
+      ↓
+CatBoost training
+      ↓
+Completely unseen routes
+      ↓
+Validation / Test
+```
+
+The current V6 cold split contains:
+
+```text
+Training:   13,596 observations
+Validation:  2,825 observations
+Test:        3,223 observations
+```
+
+Route distribution:
+
+```text
+Training routes:   515
+Validation routes: 110
+Test routes:       111
+```
+
+Sanity checks ensure that the route sets do not overlap across training, validation and test partitions.
+
+This means that a route evaluated in the cold validation or cold test partition was not present in the cold training route set.
+
+Multiple configurations were evaluated.
+
+Two important candidates were:
+
+```text
+cold_route_depth8
+cold_no_route_depth5_l2_15
+```
+
+Validation performance:
+
+```text
+cold_route_depth8
+
+MAE  = 80.6460 USD
+R²   = 0.7325
+MAPE = 19.52%
+```
+
+and:
+
+```text
+cold_no_route_depth5_l2_15
+
+MAE  = 80.6521 USD
+R²   = 0.7188
+MAPE = 19.11%
+```
+
+The validation MAE difference between these two candidates was approximately:
+
+```text
+0.006 USD
+```
+
+The current selection rule chooses the configuration with the lowest validation MAE.
+
+Therefore, the deployed V6 cold model is:
+
+```text
+cold_route_depth8
+```
+
+Final held-out cold test results:
+
+```text
+MAE   = 66.67 USD
+RMSE  = 96.86 USD
+R²    = 0.7570
+MAPE  = 19.98%
+```
+
+Although the selected cold model contains the `route` feature, the exact routes used in validation and testing were not present in the training route set.
+
+The experiment therefore still evaluates generalization to unseen origin-destination pairs.
+
+---
+
+## Model Selection Strategy
+
+Training, model selection and final evaluation are separated.
+
+Conceptually:
+
+```text
+Training Set
+     ↓
+Train candidate models
+     ↓
+Validation Set
+     ↓
+Select configuration
+with lowest validation MAE
+     ↓
+Test Set
+     ↓
+Final performance
+```
+
+The test set is not used for selecting the winning model configuration.
+
+The warm and cold evaluations measure different problems.
+
+```text
+Warm evaluation
+
+new observations
+from historically known routes
+```
+
+versus:
+
+```text
+Cold evaluation
+
+observations from routes
+not seen during cold training
+```
+
+Therefore, warm and cold benchmark metrics should not be interpreted simply as two models competing on exactly the same prediction problem.
 
 ---
 
@@ -522,71 +749,79 @@ route not in warm_known_routes
 
 This prevents training-serving inconsistencies.
 
-A route that appears in the database after model training remains a cold-start route until the model is retrained.
+A route that appears in the database after model training remains a cold-start route until the models are retrained.
 
----
-
-## Real Cold-Start Example
-
-A newly tested route produced:
+The current V6 metadata contains:
 
 ```text
-Route: THE -> CGH
-Company: Azul Linhas Aereas
-Departure: 20:35
-Arrival: 19:25
-Duration: 1380 minutes
-Stops: 1
-Booking lead time: 3 days
+warm_known_routes
 ```
 
-The route was not part of the warm model metadata:
+with:
 
 ```text
-route_known = false
-model_used  = cold
+577 routes
 ```
-
-Results:
-
-```text
-Observed price:       USD 478.00
-Model expected price: USD 455.04
-Deviation:            USD +22.96
-Cold benchmark MAE:   USD 109.37
-```
-
-The observed value was therefore well within the historical error range of the cold-start model for this example.
 
 ---
 
 ## Important Features
 
-Some of the most relevant features observed during model training are:
+The V6 models provide separate feature-importance measurements for warm-start and cold-start prediction.
+
+### Warm Model
+
+Current warm feature importance:
 
 ```text
-flight_to
-route
-company
-days_until_departure
-duration_minutes
-flight_from
-search_hour
-stops
-connection_count
+days_until_departure    18.17
+route                   16.30
+flight_to               15.19
+company                 13.19
+flight_from              9.07
+duration_minutes         7.29
+search_hour              4.50
+arrival_minutes          3.41
+departure_minutes        3.33
+stops                    3.10
+departure_weekday        2.95
+connection_count         2.28
+self_transfer            1.24
 ```
 
-One particularly important feature is:
+### Cold Model
+
+Current cold feature importance:
+
+```text
+flight_to               23.13
+days_until_departure    18.94
+company                 12.12
+flight_from             11.33
+duration_minutes         9.21
+route                    8.00
+arrival_minutes          3.81
+search_hour              3.75
+connection_count         2.64
+stops                    2.54
+departure_minutes        2.03
+departure_weekday        1.89
+self_transfer            0.62
+```
+
+One particularly important variable in both models is:
 
 ```text
 days_until_departure
 ```
 
-The current dataset shows a strong relationship between booking lead time and observed prices.
+The dataset contains a substantial relationship between booking lead time and observed price.
 
-For example, historical average prices were substantially higher close to the departure date than several days before departure.
+This should be interpreted as predictive feature importance rather than as a causal conclusion.
 
-This should be interpreted as an observed predictive relationship rather than a causal conclusion.
+Feature importance describes how useful a variable was for the fitted model.
+
+It does not imply that changing that variable alone would cause a proportional change in ticket price.
 
 ---
 
@@ -598,24 +833,42 @@ Training is implemented in:
 ml/train_model.py
 ```
 
-The training procedure generates:
+The current V6 training procedure generates:
 
 ```text
-ml/models/flight_price_catboost_cold_v3.cbm
-ml/models/flight_price_catboost_warm_v3.cbm
-ml/models/flight_price_catboost_v3_metadata.joblib
+ml/models/flight_price_catboost_warm_v6.cbm
+ml/models/flight_price_catboost_cold_v6.cbm
+ml/models/flight_price_catboost_v6_metadata.joblib
 ```
 
-The metadata contains information such as:
+The metadata artifact stores the information required to keep training and serving behavior consistent.
+
+Current metadata fields include:
 
 ```text
-features
-categorical_features
-numeric_features
+version
+selection_rule
+target
+
+warm_features
+warm_categorical_features
 warm_known_routes
-evaluation metrics
-feature importance
+warm_experiment
+warm_feature_importance
+warm_test_metrics
+
+cold_features
+cold_categorical_features
+cold_experiment
+cold_feature_importance
+cold_test_metrics
+
+numeric_features
 ```
+
+Warm and cold models are allowed to use different feature configurations.
+
+For this reason, the inference layer obtains feature definitions directly from the training metadata.
 
 ---
 
@@ -631,11 +884,24 @@ The prediction layer:
 
 1. receives business-level flight information;
 2. recreates the same model features used during training;
-3. determines whether the route is warm or cold;
-4. selects the appropriate CatBoost artifact;
-5. returns the predicted price.
+3. creates the origin-destination route;
+4. determines whether the route belongs to `warm_known_routes`;
+5. selects the corresponding warm or cold model;
+6. uses the feature list stored for that model;
+7. returns the predicted price and model metadata.
 
-This prevents feature transformation logic from being duplicated inside the API layer.
+Conceptually:
+
+```python
+if route in warm_known_routes:
+    model = warm_model
+    features = warm_features
+else:
+    model = cold_model
+    features = cold_features
+```
+
+This prevents feature transformation logic from being duplicated inside the API layer and keeps inference consistent with training.
 
 ---
 
@@ -681,17 +947,13 @@ Example response:
   "route": "CNF_MCZ",
   "route_known": true,
   "model_used": "warm",
-  "expected_mae_usd": 78.09,
-  "approx_price_range_usd": {
-    "low": 304.65,
-    "high": 460.83
-  }
+  "expected_mae_usd": 65.96
 }
 ```
 
-`expected_mae_usd` is the aggregate benchmark MAE of the selected model.
+`expected_mae_usd` is the aggregate benchmark MAE obtained on the held-out test set for the selected model.
 
-It should not be interpreted as a formal prediction interval or confidence interval.
+It should not be interpreted as a formal confidence interval or prediction interval.
 
 ---
 
@@ -699,10 +961,10 @@ It should not be interpreted as a formal prediction interval or confidence inter
 
 The inference application is containerized.
 
-Current image:
+Current production image:
 
 ```text
-flight-price-api:v1
+flight-price-api:v6
 ```
 
 The inference container contains:
@@ -710,10 +972,18 @@ The inference container contains:
 ```text
 FastAPI
 predict.py
-CatBoost artifacts
+CatBoost warm artifact
+CatBoost cold artifact
+V6 metadata
 ```
 
 Training is intentionally separated from the serving container.
+
+The deployed Kubernetes image is:
+
+```text
+docker.io/library/flight-price-api:v6
+```
 
 ---
 
@@ -762,6 +1032,14 @@ The k3s data directory is configured outside the system root partition:
 /mnt/armazenamento/k3s
 ```
 
+The V6 deployment was validated with both replicas running successfully:
+
+```text
+READY   STATUS
+1/1     Running
+1/1     Running
+```
+
 ---
 
 ## Ingress
@@ -803,7 +1081,9 @@ Kubernetes Service
    ↓
 API Pod
    ↓
-CatBoost
+FastAPI
+   ↓
+CatBoost V6
 ```
 
 No `kubectl port-forward` is required for normal local access.
@@ -831,6 +1111,8 @@ executes:
 ```text
 Skiplagged
     ↓
+Web Scraper
+    ↓
 Kafka Producer
     ↓
 Kafka Topic
@@ -847,191 +1129,300 @@ Traefik Ingress
     ↓
 FastAPI
     ↓
-CatBoost
+CatBoost V6
 ```
 
 The test calculates the same SHA-256 hash used by the Kafka consumer and tracks the exact events generated during the execution.
 
 This allows the system to verify that the same flight record successfully propagated through all pipeline layers.
 
----
-
-## End-to-End Example — Warm Route
-
-Real test:
+The validation therefore checks not only model inference but also:
 
 ```text
-Route: CNF -> MCZ
-Company: LATAM
-Departure: 18:00
-Arrival: 02:05
-Duration: 480 minutes
-Stops: 1
-Booking lead time: 6 days
+data collection
++
+event delivery
++
+database persistence
++
+feature engineering
++
+production inference
 ```
-
-Result:
-
-```text
-Observed price:       USD 356.00
-Model expected price: USD 382.74
-Deviation:            USD -26.74
-
-Model:                warm
-Route known:          true
-Benchmark MAE:        USD 78.09
-```
-
-The observed ticket was within the model's expected error range.
 
 ---
 
-## End-to-End Example — Cold Route
+## End-to-End Production Example
 
-Real test:
+A real end-to-end execution was performed on September 26, 2026.
+
+Flight:
 
 ```text
-Route: THE -> CGH
+Route: BSB -> CNF
 Company: Azul Linhas Aereas
-Duration: 1380 minutes
-Stops: 1
+Departure: 05:35
+Arrival: 06:55
+Duration: 60 minutes
+Stops: 0
 Booking lead time: 3 days
 ```
 
-Result:
+The scraper found:
 
 ```text
-Observed price:       USD 478.00
-Model expected price: USD 455.04
-Deviation:            USD +22.96
-
-Model:                cold
-Route known:          false
-Benchmark MAE:        USD 109.37
+7 flights
 ```
 
-This example demonstrates that the cold-start model can estimate a reasonable price even when the exact route was not part of the warm training universe.
+The generated events successfully traveled through:
+
+```text
+Kafka
+ ↓
+RAW
+ ↓
+SILVER
+ ↓
+GOLD
+ ↓
+Production API
+```
+
+For one tracked flight:
+
+```text
+RAW ID:
+39c55cb2-e7a8-43af-b35d-a6111ec7406a
+```
+
+The observed result was:
+
+```text
+Observed price:       USD 232.00
+Model expected price: USD 312.99
+
+Residual:             USD -80.99
+Absolute error:       USD 80.99
+```
+
+Inference metadata:
+
+```text
+Model:                warm
+Route known:          true
+Warm benchmark MAE:   USD 65.96
+```
+
+The model therefore classified the observation as:
+
+```text
+BELOW EXPECTED
+```
+
+because:
+
+```text
+232.00 < 312.99
+```
+
+The interpretation is:
+
+> The currently observed market price is below the expected reference value learned by the model for flights with similar characteristics.
+
+This does **not** mean that the ticket price will necessarily increase later.
+
+The model estimates expected price, not future price direction.
 
 ---
 
 ## Current Dataset
 
-At the initial model-training stage, the GOLD dataset contained approximately:
+The current GOLD dataset contains approximately:
 
 ```text
-9,192 flight observations
-459 routes
+19,650 flight observations
+736 routes
 4 airline categories
 ```
 
-The current validated range of:
+The currently observed booking horizon is:
 
 ```text
-days_until_departure
+days_until_departure = 0 to 60 days
 ```
 
-is:
+The dataset therefore contains observations ranging from flights searched on the day of departure to flights searched approximately two months before departure.
+
+An important distinction is:
 
 ```text
-0 to 7 days
+booking horizon
+!=
+historical temporal depth
 ```
 
-Therefore, predictions far outside this booking horizon should currently be considered out of the validated model domain.
+For example:
+
+```text
+search today
+for a flight departing in 60 days
+```
+
+provides a large booking lead time.
+
+However, it does not provide a 60-day historical price trajectory for that route.
+
+The current dataset is appropriate for the existing expected-price regression problem.
+
+The principal remaining data limitation is the amount of repeated observation of the same routes across longer calendar periods.
 
 ---
 
-## Overfitting and Validation
+## Model Validation
 
-The warm model presents evidence of a train-validation generalization gap.
-
-Near the end of training:
+The V6 training procedure separates:
 
 ```text
-Training MAE   ≈ 29.6
-Validation MAE ≈ 65.6
-Test MAE       ≈ 78.1
+training
+validation
+test
 ```
 
-This indicates some overfitting risk.
+Candidate model configurations are trained using the training partition.
 
-However, the warm model still substantially outperforms the route-median baseline on the held-out test set:
+The validation partition is used to select the winning configuration.
+
+The test partition is reserved for final evaluation.
+
+### Warm validation
+
+The warm experiment evaluates new observations from historically represented routes.
+
+Final test performance:
 
 ```text
-Route Median MAE = 103.85 USD
-CatBoost MAE     = 78.09 USD
+MAE   = 65.96 USD
+RMSE  = 104.93 USD
+R²    = 0.8018
+MAPE  = 25.76%
 ```
 
-Therefore, the current evidence suggests:
+### Cold validation
+
+The cold experiment holds entire routes outside the training route universe.
+
+Final test performance:
 
 ```text
-some overfitting risk
-+
-meaningful out-of-sample predictive signal
+MAE   = 66.67 USD
+RMSE  = 96.86 USD
+R²    = 0.7570
+MAPE  = 19.98%
 ```
 
-The current validation procedure should still be improved before making strong production-performance claims.
+The purpose of the cold experiment is not to outperform the warm model.
 
----
+It tests a different question:
 
-## Validation Improvement
+> How well does the system generalize when the exact origin-destination pair was not seen during training?
 
-Multiple itineraries can originate from the same scraper execution and therefore share the same search timestamp.
+The warm experiment instead evaluates:
 
-A more rigorous evaluation should prevent observations from the same search batch from appearing across training and test partitions.
-
-The planned evaluation strategy is:
-
-```text
-Grouped Temporal Split
-        ↓
-group by search batch / search_timestamp
-        ↓
-past batches → training
-future batches → validation/test
-```
-
-This will provide a stronger estimate of real-world generalization.
+> How well does the system predict new observations from routes already represented historically?
 
 ---
 
 ## Current Limitations
 
-The current system is an experimental first version.
+The current model estimates expected market price from flight characteristics and search context.
 
-Important limitations include:
+Its primary limitation is **historical temporal depth**.
 
-- limited historical time coverage;
-- booking horizons currently concentrated between 0 and 7 days;
-- no full seasonal cycle;
-- no holiday features;
-- no event-demand features;
-- no historical price trajectory features;
-- no explicit airline promotion information;
-- no formal prediction intervals;
-- limited evidence regarding long-term temporal generalization.
+Although the dataset contains almost 20,000 observations and booking horizons between 0 and 60 days, most routes have not yet been repeatedly observed across a long calendar period.
 
-The current model also predicts expected price, not future price direction.
+Therefore, the current system should not be interpreted as a temporal forecasting model.
+
+It does not currently model the full historical trajectory:
+
+```text
+price at t-3
+price at t-2
+price at t-1
+price at t
+```
+
+for the same flight or route over extended periods.
+
+The current model predicts:
+
+```text
+Expected price
+given current flight/search characteristics
+```
+
+rather than:
+
+```text
+Future price direction
+```
 
 ---
 
 ## Future Work
 
-Planned improvements include:
+The main future improvement is to increase **temporal depth**.
 
-1. Increase historical data collection.
-2. Expand booking lead times.
-3. Use grouped temporal validation by search batch.
-4. Add flight price history features.
-5. Add seasonal features.
-6. Add holiday and event features.
-7. Add historical USD/BRL exchange-rate enrichment.
-8. Add automated retraining.
-9. Add model versioning.
-10. Add CI/CD.
-11. Add Prometheus metrics.
-12. Add Grafana dashboards.
-13. Add prediction and data drift monitoring.
-14. Add model-performance monitoring.
-15. Add formal prediction intervals.
-16. Build a decision layer for below/within/above expected market price.
-17. Evaluate future-price-direction models separately from expected-price models.
+Future data collection should repeatedly observe a fixed set of routes across time.
+
+Conceptually:
+
+```text
+Route A
+  ↓
+Search on day t
+  ↓
+Search on day t + 1
+  ↓
+Search on day t + 2
+  ↓
+Search on day t + 3
+  ↓
+...
+```
+
+This would produce historical price trajectories instead of isolated search snapshots.
+
+With sufficient temporal depth, a future modeling stage could investigate:
+
+```text
+historical price movement
+rolling price statistics
+recent price trend
+price acceleration
+route-level temporal behavior
+```
+
+and eventually formulate a separate problem such as:
+
+```text
+Will the flight price increase,
+decrease,
+or remain approximately stable?
+```
+
+This should be treated as a separate machine-learning problem from the current model.
+
+The current project estimates:
+
+```text
+E[price | flight characteristics, search context]
+```
+
+while a future temporally deep model could investigate:
+
+```text
+future price behavior
+given historical price trajectory
+```
+
+Therefore, temporal depth is an extension of the current architecture rather than a requirement for the existing expected-price model.
